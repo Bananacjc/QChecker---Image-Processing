@@ -1,4 +1,4 @@
 # Folder
-./known_faces
-./student_qrcodes
-./.venv
+known_faces
+student_qrcodes
+.venv
