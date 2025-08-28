@@ -2,3 +2,4 @@
 known_faces
 student_qrcodes
 .venv
+.env
