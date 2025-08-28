@@ -1,6 +1,10 @@
 # Folder
 known_faces
 student_qrcodes
+
+# File
 .venv
 .env
+
+# File type
 *.zip
