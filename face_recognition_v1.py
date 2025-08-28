@@ -1,6 +1,9 @@
 import cv2
 import numpy as np
 from abc import ABC, abstractmethod
+import firebase_admin
+from firebase_admin import credentials, firestore
+
 
 '''
 Stage 1: Face Detection (Skin Color Segmentation + Morphology)
@@ -63,6 +66,46 @@ Improve robustness with:
 Illumination normalization (histogram equalization).
 Face alignment (eyes aligned before recognition).
 '''
+
+def get_db():
+    if not firebase_admin._apps:
+        cred = credentials.Certificate("graduation-ceremony-qchecker-firebase-adminsdk-fbsvc-a3b4c410c5.json")
+        firebase_admin.initialize_app(cred)
+    return firestore.client()
+
+def fetch_students(only_registered=None):
+    """
+    Read Firestore collection 'students' and return a list of dicts:
+    seat_num (str), student_id (str), name, course, award, image_path
+    Set only_registered=True/False to filter; None returns all.
+    """
+    db = get_db()
+    col = db.collection("students")
+    q = col
+
+    if only_registered is not None:
+        q = q.where("registered", "==", bool(only_registered))
+
+    # sort by seat number if you want deterministic order
+    q = q.order_by("seat_num")
+
+    result = []
+    for snap in q.stream():
+        data = snap.to_dict() or {}
+        result.append({
+            "seat_num": str(data.get("seat_num", "")),
+            "student_id": snap.id,
+            "name": data.get("name", ""),
+            "course": data.get("course", ""),
+            "award": data.get("award", ""),
+            "image_path": data.get("image_path", ""),
+        })
+    return result
+
+def fetch_student_by_id(student_id: str):
+    db = get_db()
+    doc = db.collection("students").document(student_id).get()
+    return doc.to_dict() if doc.exists else None
 
 class ImageAugmenter:
     def __init__(self, 
@@ -584,25 +627,7 @@ class FacePipeline:
 
 if __name__ == '__main__':
     
-    students = [
-        {
-            "seat_num": "1",
-            "student_id": "24WMR09274",
-            "name": "Tan Jee Cheng",
-            "course": "Bachelor of Software Engineering",
-            "award": "Graduated with Distinction",
-            "image_path": "known_faces/24WMR09274.png"
-        },
-        {
-            "seat_num": "2",
-            "student_id": "24WMR09155",
-            "name": "Cheong Jau Chun",
-            "course": "Bachelor of Computer Science",
-            "award": "Dean's List",
-            "image_path": "known_faces/24WMR09155.jpg"
-        },
-    ]
-    
+    students = fetch_students(only_registered=True)
     
     faceExtractor = LBFFeatureExtractor()
     system = FacePipeline(students, extractor=faceExtractor)
