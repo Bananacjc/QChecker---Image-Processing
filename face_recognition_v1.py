@@ -4,6 +4,8 @@ from abc import ABC, abstractmethod
 import firebase_admin
 from firebase_admin import credentials, firestore
 from dotenv import load_dotenv
+import os
+import json
 
 '''
 Stage 1: Face Detection (Skin Color Segmentation + Morphology)
@@ -68,9 +70,22 @@ Face alignment (eyes aligned before recognition).
 '''
 
 def get_db():
+    # Load variables from the .env file into the environment
+    load_dotenv(dotenv_path='./.env')
+
+    # Get the FIREBASE_CREDENTIALS variable
+    raw = os.environ.get("FIREBASE_CREDENTIALS")
+    if not raw:
+        raise RuntimeError("Missing FIREBASE_CREDENTIALS in your .env file")
+
+    # Parse JSON and fix private key newlines
+    cfg = json.loads(raw)
+    cfg["private_key"] = cfg["private_key"].replace("\n", "\n")
+
     if not firebase_admin._apps:
-        cred = credentials.Certificate(load_dotenv(dotenv_path='./.env'), 'FIREBASE_CREDENTIALS')
+        cred = credentials.Certificate(cfg)
         firebase_admin.initialize_app(cred)
+
     return firestore.client()
 
 def fetch_students(only_registered=None):
@@ -510,7 +525,7 @@ class FaceRecognizer:
         if intra_dists:
             self.threshold = max(intra_dists) * 1.2  # allow small margin
         else:
-            self.threshold = 0.3  # fallback
+            self.threshold = 0.1  # fallback
 
     def recognize(self, face_img):
         if not self._trained or not self.database:
@@ -629,7 +644,7 @@ if __name__ == '__main__':
     
     students = fetch_students(only_registered=True)
     
-    faceExtractor = LBFFeatureExtractor()
+    faceExtractor = PCAFeatureExtractor()
     system = FacePipeline(students, extractor=faceExtractor)
    
     system.run(camera_index=1)
