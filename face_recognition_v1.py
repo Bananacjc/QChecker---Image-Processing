@@ -511,7 +511,7 @@ class FacePipeline:
         training_labels = []
 
         for student in self.students:
-            img = cv2.imread(student["image_path"])
+            img = cv2.imread(f"./known_faces/{student["image_path"]}")
             if img is None:
                 print(f"Could not load {student['image_path']}")
                 continue
