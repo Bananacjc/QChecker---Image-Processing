@@ -569,7 +569,7 @@ class FacePipeline:
         training_labels = []
 
         for student in self.students:
-            img = cv2.imread(f"./known_faces/{student["image_path"]}")
+            img = cv2.imread(f"./known_faces/{student['image_path']}")
             if img is None:
                 print(f"Could not load {student['image_path']}")
                 continue
@@ -644,8 +644,8 @@ if __name__ == '__main__':
     
     students = fetch_students(only_registered=True)
     
-    faceExtractor = PCAFeatureExtractor()
+    faceExtractor = LBFFeatureExtractor()
     system = FacePipeline(students, extractor=faceExtractor)
    
-    system.run(camera_index=1)
+    system.run(camera_index=0)
     
