@@ -3,7 +3,7 @@ import numpy as np
 from abc import ABC, abstractmethod
 import firebase_admin
 from firebase_admin import credentials, firestore
-
+from dotenv import load_dotenv
 
 '''
 Stage 1: Face Detection (Skin Color Segmentation + Morphology)
@@ -69,7 +69,7 @@ Face alignment (eyes aligned before recognition).
 
 def get_db():
     if not firebase_admin._apps:
-        cred = credentials.Certificate("graduation-ceremony-qchecker-firebase-adminsdk-fbsvc-a3b4c410c5.json")
+        cred = credentials.Certificate(load_dotenv(dotenv_path='./.env'), 'FIREBASE_CREDENTIALS')
         firebase_admin.initialize_app(cred)
     return firestore.client()
 
