@@ -186,12 +186,12 @@ class SkinSegmentationDetector(Detector):
                      ycrcb_max=[255, 173, 127],
                      hsv_min=[0, 40, 60],
                      hsv_max=[50, 150, 255],
-                     width_min=50,
-                     height_min=50,
+                     width_min=30,
+                     height_min=30,
                      aspect_ratio_min=1.0,
                      aspect_ratio_max=1.9,
-                     frame_area_min=0.07,
-                     frame_area_max=0.3,
+                     frame_area_min=0.01,
+                     frame_area_max=0.7,
                      debug=False):
             
             self.color_space = color_space.lower()
@@ -257,12 +257,15 @@ class SkinSegmentationDetector(Detector):
                     self.frame_area_min*frame_area < area < self.frame_area_max*frame_area):
                     faces.append((x,y,w,h))
             
+            if not faces:
+                faces = None
+            
             return faces, (mask if self.debug else None)
 
 class ViolaJonesDetector(Detector):
         def __init__(self, cascade_path=None, 
                      scaleFactor=1.1, 
-                     minNeighbors=5, 
+                     minNeighbors=3, 
                      minSize=(50, 50),
                      debug=False):
             if cascade_path is None:
@@ -339,7 +342,6 @@ class PCAFeatureExtractor(FeatureExtractor):
         X = np.array([f.flatten() for f in faces])
         self.mean = np.mean(X, axis=0)
         X_centered = X - self.mean
-        
         U, S, Vt = np.linalg.svd(X_centered, full_matrices=False)
         self.components = Vt[:self.num_components]
     
@@ -525,7 +527,7 @@ class FaceRecognizer:
         if intra_dists:
             self.threshold = max(intra_dists) * 1.2  # allow small margin
         else:
-            self.threshold = 0.1  # fallback
+            self.threshold = 0.3  # fallback
 
     def recognize(self, face_img):
         if not self._trained or not self.database:
@@ -608,26 +610,27 @@ class FacePipeline:
         
             faces, other = self.detector.detect_faces(frame)
             
-            for (x, y, w, h) in faces:
-                cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
-                face_img = self.preprocessor.preprocess(frame, (x, y, w, h))
-                
-                if self.preprocessor.debug:
-                    cv2.imshow("Preprocessed Face", face_img)
+            if faces is not None:
+                for (x, y, w, h) in faces:
+                    cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
+                    face_img = self.preprocessor.preprocess(frame, (x, y, w, h))
                     
-                sid = self.recognizer.recognize(face_img)
-                
-                if sid != "Unknown":
-                    info = next((d for d in self.students if d["name"] == sid), None)
-                    if info:
-                        text = f"{info['name']} ({info['award']})"
+                    if self.preprocessor.debug:
+                        cv2.imshow("Preprocessed Face", face_img)
+                        
+                    sid = self.recognizer.recognize(face_img)
+                    
+                    if sid != "Unknown":
+                        info = next((d for d in self.students if d["name"] == sid), None)
+                        if info:
+                            text = f"{info['name']} ({info['award']})"
+                        else:
+                            text = sid
                     else:
-                        text = sid
-                else:
-                    text = "Unkown"
-                
-                cv2.putText(frame, text, (x,y-10), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
+                        text = "Unkown"
+                    
+                    cv2.putText(frame, text, (x,y-10), 
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
                 
             cv2.imshow(self.detector.name, frame)
             
@@ -644,8 +647,10 @@ if __name__ == '__main__':
     
     students = fetch_students(only_registered=True)
     
+    
     faceExtractor = LBFFeatureExtractor()
-    system = FacePipeline(students, extractor=faceExtractor)
+    faceDetector = SkinSegmentationDetector()
+    system = FacePipeline(students, extractor=faceExtractor, detector=faceDetector)
    
     system.run(camera_index=0)
     
