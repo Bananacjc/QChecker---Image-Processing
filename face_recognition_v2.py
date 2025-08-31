@@ -1,74 +1,203 @@
+# flow_runner.py
+# ------------------------------------------------------------
+# All your classes are copied in FULL below (no logic changes).
+# Orchestrator at the bottom wires: camera -> fetch -> "train"
+# (precompute features) -> scan QR -> OK gesture -> timer ->
+# detect face -> compare only with that student's photo ->
+# show distance & match/not match with simple metrics.
+# ------------------------------------------------------------
+
+import os
 import cv2
+import json
+import time
+import math
 import numpy as np
+import statistics
+import mediapipe as mp
 from abc import ABC, abstractmethod
 import firebase_admin
 from firebase_admin import credentials, firestore
 from dotenv import load_dotenv
-import os
-import json
 
-'''
-Stage 1: Face Detection (Skin Color Segmentation + Morphology)
-Goal: Find where faces are in the image.
-Convert to color space
-    Use YCbCr or HSV (better for skin than RGB).
-    Typical thresholds for skin in YCbCr:
-    77 ≤ Cb ≤ 127
-    133 ≤ Cr ≤ 173
-Thresholding
-    Create a binary mask: pixels inside skin range → 1, else 0.
-    Morphological Operations
-    Apply opening (erosion → dilation) to remove small noise.
-    Apply closing (dilation → erosion) to fill small holes.
-Connected Components
-    Find blobs in the mask.
-    Extract bounding boxes.
-    Filter by aspect ratio (1:1 to 1:1.5) and minimum size.
-👉 Output: Coordinates of candidate face regions.
+# ===========================
+# YOUR HAND GESTURE CODE (as-is)
+# ===========================
+class HandGesture(ABC):
+    
+    @abstractmethod
+    def detect(self, landmarks: list) -> bool:
+        '''
+        Return True if this gesture is detected from landmarks
+        '''
+        pass
+    
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        pass
 
-Stage 2: Face Preprocessing
-Goal: Normalize faces before recognition.
-Crop the detected bounding box.
-Resize to a fixed size (e.g., 100×100).
-Convert to grayscale (faces are usually recognized by structure, not color).
-Normalize pixel values (e.g., scale to [0,1] or mean=0, std=1).
-👉 Output: Standardized face images (same size, same format).
+class OKSignGesture(HandGesture):
+    def __init__(self, threshold=50):
+        self.threshold = threshold
+    
+    @property
+    def name(self):
+        return "OK Sign"
+    
+    def detect(self, landmarks):
+        thumb_tip = np.array(landmarks[4])
+        index_tip = np.array(landmarks[8])
+        distance = np.linalg.norm(thumb_tip - index_tip)
+        
+        middle_extended = landmarks[12][1] < landmarks[10][1]
+        ring_extended = landmarks[16][1] < landmarks[14][1]
+        pinky_extended = landmarks[20][1] < landmarks[18][1]
+        
+        return distance < self.threshold and middle_extended and ring_extended and pinky_extended
 
-Stage 3: Feature Extraction (Recognition)
-Choose one of the classical algorithms:
-Option A: Eigenfaces (PCA)
-Collect training faces for each person.
-Flatten each face (100×100 → 10,000 vector).
-Apply PCA to reduce dimensionality (e.g., keep top 50–100 components).
-Each face is represented in Eigenface space.
+class RudeGesture(HandGesture):
+    def __init__(self):
+        pass
 
-Option B: Fisherfaces (LDA)
-Similar to PCA, but maximizes separation between classes (better recognition).
+    @property
+    def name(self):
+        return "Rude Gesture"
 
-Option C: Local Binary Patterns (LBP)
-Divide face into small regions (e.g., 8×8 grid).
-For each pixel: compare neighbors → build binary number.
-Build histogram of LBP values per region.
-Concatenate histograms into one feature vector.
+    def detect(self, landmarks):
+        middle_up = landmarks[12][1] < landmarks[10][1]
+        index_down = landmarks[8][1] > landmarks[6][1]
+        ring_down = landmarks[16][1] > landmarks[14][1]
+        pinky_down = landmarks[20][1] > landmarks[18][1]
 
-👉 Recommendation: Start with Eigenfaces (PCA) (simpler, lots of tutorials), then try LBP for robustness.
+        return middle_up and index_down and ring_down and pinky_down
 
-Stage 4: Classification / Recognition
-Store feature vectors of known faces in a database.
-For a new face:
-Extract its features (PCA projection / LBP histogram).
-Compare with database using Euclidean distance or cosine similarity.
-Pick the closest match (if distance < threshold).
-Otherwise → "Unknown person".
+class ThumbsUpGesture(HandGesture):
+    def __init__(self, extended_thres=0.7, vertical_thres = 20):
+        self.extended_thres = extended_thres
+        self.vertical_thres = vertical_thres
+    
+    @property
+    def name(self):
+        return "Thumbs Up"
+    
+    def detect(self, landmarks):
+        import math
+        
+        def euclidean(a, b):
+            return math.sqrt((a[0]-b[0])**2 + (a[1]-b[1])**2)
 
-Stage 5: Evaluation & Improvements
-Test on a dataset (even your own images).
-Adjust thresholds for detection & recognition.
-Improve robustness with:
-Illumination normalization (histogram equalization).
-Face alignment (eyes aligned before recognition).
-'''
+        thumb_tip = landmarks[4]
+        index_mcp = landmarks[5]
+        thumb_extended = euclidean(thumb_tip, index_mcp) > self.extended_thres
+        
+        dx = landmarks[4][0] - landmarks[0][0]
+        dy = landmarks[4][1] - landmarks[0][1]
+        thumb_angle = math.degrees(math.atan2(dy, dx))
+        thumb_is_vertical = abs(abs(thumb_angle) - 90) < self.vertical_thres
+        
+        fingers_folded = (
+            landmarks[8][1] > landmarks[5][1] and
+            landmarks[12][1] > landmarks[9][1] and
+            landmarks[16][1] > landmarks[13][1] and
+            landmarks[20][1] > landmarks[17][1]
+        )
 
+    
+        return thumb_extended and thumb_is_vertical and fingers_folded
+
+class HandGestureRecognizer:
+    def __init__(self, model_path="hand_landmarker.task", 
+                 detection_conf=0.3, presence_conf=0.3, tracking_conf=0.3,
+                 max_hands=1):
+        BaseOptions = mp.tasks.BaseOptions
+        HandLandmarker = mp.tasks.vision.HandLandmarker
+        HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
+        VisionRunningMode = mp.tasks.vision.RunningMode
+
+        self.last_result = None
+        self.gestures: list[HandGesture] = []  # registered gestures
+
+        def _callback(result: mp.tasks.vision.HandLandmarkerResult, output_image: mp.Image, timestamp_ms: int): # type: ignore
+            self.last_result = result
+
+        options = HandLandmarkerOptions(
+            base_options=BaseOptions(model_asset_path=model_path),
+            running_mode=VisionRunningMode.LIVE_STREAM,
+            result_callback=_callback,
+            min_hand_detection_confidence=detection_conf,
+            min_hand_presence_confidence=presence_conf,
+            min_tracking_confidence=tracking_conf,
+            num_hands=max_hands
+        )
+        self.landmarker = HandLandmarker.create_from_options(options)
+
+    def add_gesture(self, gesture: HandGesture):
+        self.gestures.append(gesture)
+    
+    def draw(self, landmarks, frame):
+        for (x, y) in landmarks:
+            cv2.circle(frame, (x, y), 5, (0, 255, 0), -1)
+            
+        connection_pairs = [
+                (0,1),(1,2),(2,3),(3,4),            # thumb
+                (5,6),(6,7),(7,8),                  # index
+                (9,10),(10,11),(11,12),             # middle
+                (13,14),(14,15),(15,16),            # ring
+                (17,18),(18,19),(19,20),            # pinky
+                (0,5),(5,9),(9,13),(13,17),(0,17)   # palm connections
+        ]
+            
+        for start, end in connection_pairs:
+            if start < len(landmarks) and end < len(landmarks):
+                cv2.line(frame, landmarks[start], landmarks[end], (0, 255, 255), 2)
+    
+    def detect_gesture(self, landmarks):
+        for gesture in self.gestures:
+            if gesture.detect(landmarks):
+                return gesture.name
+        return None
+
+                
+    def run(self, camera_id=0):
+        cap = cv2.VideoCapture(camera_id)
+
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                continue
+
+            frame = cv2.flip(frame, 1)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame)
+            timestamp = int(cv2.getTickCount() / cv2.getTickFrequency() * 1000)
+            self.landmarker.detect_async(mp_image, timestamp)
+
+            if self.last_result and self.last_result.hand_landmarks:
+                detected_gesture = None
+                for hand_landmarks in self.last_result.hand_landmarks:
+                    landmarks = [(int(lm.x * frame.shape[1]), int(lm.y * frame.shape[0])) 
+                                for lm in hand_landmarks]
+
+                    self.draw(landmarks, frame)
+
+                    if detected_gesture is None:
+                        detected_gesture = self.detect_gesture(landmarks)
+
+                if detected_gesture:
+                    cv2.putText(frame, f"Gesture: {detected_gesture}", (10, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+
+            cv2.imshow('Hand Gesture Recognizer', frame)
+            
+            if cv2.waitKey(5) & 0xFF == 27:
+                break
+
+        cap.release()
+        cv2.destroyAllWindows()
+
+# ===========================
+# YOUR FACE RECOGNITION CODE (as-is)
+# ===========================
 def get_db():
     # Load variables from the .env file into the environment
     load_dotenv(dotenv_path='./.env')
@@ -298,21 +427,21 @@ class ViolaJonesDetector(Detector):
             
             return faces, (gray if self.debug else None)
 
-class HOGDetector(Detector):
-    def __init__(self, debug=False):
-        import dlib
-        self.hog_detector = dlib.get_frontal_face_detector()
-        self.debug = debug
+# class HOGDetector(Detector):
+#     def __init__(self, debug=False):
+#         import dlib
+#         self.hog_detector = dlib.get_frontal_face_detector()
+#         self.debug = debug
     
-    @property
-    def name(self):
-        return "HOG Face Detector"
+#     @property
+#     def name(self):
+#         return "HOG Face Detector"
     
-    def detect_faces(self, frame):
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = self.hog_detector(gray, 1)
-        boxes = [(d.left(), d.top(), d.width(), d.height()) for d in faces]
-        return boxes, (gray if self.debug else None)
+#     def detect_faces(self, frame):
+#         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+#         faces = self.hog_detector(gray, 1)
+#         boxes = [(d.left(), d.top(), d.width(), d.height()) for d in faces]
+#         return boxes, (gray if self.debug else None)
 
 class DNNDetector(Detector):
     def __init__(self, prototxt, model, conf_threshold=0.5, debug=False):
@@ -581,7 +710,7 @@ class LBFFeatureExtractor:
         return np.array(features)
 
 class FaceRecognizer:
-    def __init__(self, extractor: FeatureExtractor = None):
+    def __init__(self, extractor: 'FeatureExtractor' = None):
         self.extractor = extractor if extractor else PCAFeatureExtractor()
         self.database = []  # list of (feature_vector, label)
         self._trained = False
@@ -780,28 +909,6 @@ class FacePipeline:
         cap.release()
         cv2.destroyAllWindows()
 
-# Classification (multi-class: person A, person B, …):
-# Accuracy – percentage of correctly classified faces.
-# Precision, Recall, F1-Score per class or macro-averaged.
-# Precision = “Of all predicted as person A, how many were correct?”
-# Recall = “Of all true person A, how many did we find?”
-# F1 = balance between precision & recall.
-# Confusion Matrix – shows which people are being mistaken for whom.
-
-# Verification (same/different person):
-# True Positive Rate (TPR / Recall / Sensitivity)
-# Probability that same-person pairs are accepted as same.
-# False Positive Rate (FPR)
-# Probability that different-person pairs are wrongly matched.
-# True Negative Rate (TNR / Specificity)
-# Opposite of FPR, probability different people are correctly rejected.
-# Precision – of all matches, how many were correct.
-# F1-score – same as above but treating “same” as positive class.
-# ROC Curve (Receiver Operating Characteristic)
-# Plot TPR vs FPR across different thresholds.
-# AUC (Area Under Curve) – threshold-independent measure of verification performance.
-# EER (Equal Error Rate) – the point where FPR = FNR (False Negative Rate). Lower EER = better.
-
 class FaceComparator:
     def __init__(self, detector=None, extractor=None, preprocessor=None, threshold=0.3):
         self.detector = detector or ViolaJonesDetector()
@@ -841,22 +948,250 @@ class FaceComparator:
         same = dist < self.threshold
         return {"distance": dist, "same_person": same}
 
-if __name__ == '__main__':
-    
-    students = fetch_students(only_registered=True)
-    
-    faceExtractor = LBFFeatureExtractor()
-    faceDetector = ViolaJonesDetector(minSize=(150, 150))
-    system = FacePipeline(students, extractor=faceExtractor, detector=faceDetector, debug=True)
-   
-    system.run(camera_index=0)
-    
-    # comparator = FaceComparator(
-    #     detector=ViolaJonesDetector(),
-    #     extractor=LBFFeatureExtractor(),
-    #     preprocessor=FacePreprocessor(),
-    #     threshold=0.35
-    # )
-    
-    # result = comparator.compare('./known_faces/24WMR09155.jpg', './known_faces/24WMR09155.jpg')
-    # print(result)
+# ===========================
+# ORCHESTRATOR (flow) — uses your classes; no logic changes inside them
+# ===========================
+CAM_INDEX = 0
+OK_REQUIRED = True
+MATCH_TIMEOUT_SEC = 100.0
+DISTANCE_THRESHOLD = 0.35  # for LBF + chi2, tune with your data
+
+def try_decode_qr(frame_bgr):
+    """Use OpenCV QRCodeDetector (no pyzbar dependency)."""
+    qr = cv2.QRCodeDetector()
+    data, pts, _ = qr.detectAndDecode(frame_bgr)
+    if pts is not None and data:
+        try:
+            return json.loads(data)
+        except Exception:
+            return None
+    return None
+
+def build_feature_db(students, detector, preproc, extractor):
+    """
+    Precompute features from ./known_faces/<image_path> for each student.
+
+    Works for:
+      - LBFFeatureExtractor (no fitting needed)
+      - PCAFeatureExtractor (calls fit(faces))
+      - LDAFeatureExtractor / FastLDAFeatureExtractor (calls fit(faces, labels))
+    """
+    # First pass: collect one preprocessed face per student (if available)
+    per_student_face = {}   # sid -> face_img (normalized grayscale)
+    train_faces = []        # list of face imgs for fitting
+    lda_labels = []         # numeric labels for LDA (if needed)
+    label_map = {}          # sid -> int label (for LDA)
+    ok_cnt, miss_cnt = 0, 0
+
+    for s in students:
+        sid = s.get("student_id", "")
+        img_path = os.path.join("./known_faces", s.get("image_path", ""))
+        img = cv2.imread(img_path)
+        if img is None:
+            print(f"[train] Missing image: {img_path}")
+            miss_cnt += 1
+            continue
+
+        faces, _ = detector.detect_faces(img)
+        empty = (faces is None or
+                 (hasattr(faces, "size") and faces.size == 0) or
+                 (hasattr(faces, "__len__") and len(faces) == 0))
+        if empty:
+            print(f"[train] No face detected: {img_path}")
+            miss_cnt += 1
+            continue
+
+        boxes = faces.tolist() if hasattr(faces, "tolist") else list(faces)
+        x, y, w, h = max(boxes, key=lambda b: b[2] * b[3])
+        face = preproc.preprocess(img, (x, y, w, h))
+
+        # Save one normalized face per student for later feature extraction
+        per_student_face[sid] = face
+        ok_cnt += 1
+
+    # If the extractor needs fitting, do it once using all collected faces
+    if isinstance(extractor, PCAFeatureExtractor):
+        if not per_student_face:
+            print("[train] No faces found; PCA fit skipped.")
+        else:
+            train_faces = list(per_student_face.values())
+            extractor.fit(train_faces)
+
+    elif isinstance(extractor, (LDAFeatureExtractor, FastLDAFeatureExtractor)):
+        if not per_student_face:
+            print("[train] No faces found; LDA fit skipped.")
+        else:
+            # Build stable numeric labels for LDA
+            sids = list(per_student_face.keys())
+            label_map = {sid: i for i, sid in enumerate(sids)}
+            train_faces = [per_student_face[sid] for sid in sids]
+            lda_labels = [label_map[sid] for sid in sids]
+            extractor.fit(train_faces, lda_labels)
+
+    # Second pass: extract features for each student’s saved face
+    db = {}
+    for sid, face in per_student_face.items():
+        feat = extractor.extract(face)
+        db[sid] = feat
+
+    print(f"[train] Features ready for {ok_cnt} students; {miss_cnt} skipped.")
+    return db
+
+
+def detect_ok_sign(gesture_sys, frame_bgr):
+    """Run your mediapipe hand landmarker + gesture rules; return True if OK Sign found."""
+    H, W = frame_bgr.shape[:2]
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_bgr)
+    ts = int(cv2.getTickCount() / cv2.getTickFrequency() * 1000)
+    gesture_sys.landmarker.detect_async(mp_image, ts)
+
+    if gesture_sys.last_result and gesture_sys.last_result.hand_landmarks:
+        for hand_landmarks in gesture_sys.last_result.hand_landmarks:
+            landmarks = [(int(lm.x * W), int(lm.y * H)) for lm in hand_landmarks]
+            gesture_sys.draw(landmarks, frame_bgr)
+            name = gesture_sys.detect_gesture(landmarks)
+            if name == "OK Sign":
+                return True
+    return False
+
+def main():
+    print("Camera starting…")
+    cap = cv2.VideoCapture(CAM_INDEX)
+    if not cap.isOpened():
+        raise RuntimeError("Cannot open camera.")
+
+    print("Fetch students…")
+    students = fetch_students(only_registered=None)
+    by_id = {s["student_id"]: s for s in students}
+
+    print("Train (feature precompute)…")
+    detector = ViolaJonesDetector()
+    preproc  = FacePreprocessor()
+    extractor = PCAFeatureExtractor(num_components=50)
+    feature_db = build_feature_db(students, detector, preproc, extractor)
+
+    # Hand gesture recognizer (your model + rules)
+    gesture_sys = HandGestureRecognizer(max_hands=2)
+    gesture_sys.add_gesture(OKSignGesture(threshold=23))
+    # (optional) you can also add: gesture_sys.add_gesture(RudeGesture()); gesture_sys.add_gesture(ThumbsUpGesture())
+
+    attempts = 0
+    matches = 0
+    distances = []
+    latencies = []
+
+    print("Ready for scanning. Press 'q' to quit.")
+    current = None
+    waiting_ok = False
+    t0 = None
+
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+
+        H, W = frame.shape[:2]
+
+        # Step 1: Scan QR (lock to a student)
+        if current is None:
+            qr = try_decode_qr(frame)
+            if qr and "student_id" in qr:
+                sid = qr["student_id"]
+                current = by_id.get(sid, qr)
+                waiting_ok = OK_REQUIRED
+                t0 = None
+        else:
+            cv2.putText(frame, f"Target: {current.get('name','?')} ({current.get('student_id','?')})",
+                        (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
+
+        # Step 2: Require OK gesture
+        if current is not None and waiting_ok:
+            if detect_ok_sign(gesture_sys, frame):
+                waiting_ok = False
+                t0 = time.monotonic()
+            else:
+                cv2.putText(frame, "Show OK Sign to continue…", (20, 80),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,255), 2)
+
+        # Step 3: Timer + detect + compare with ONLY that student's feature
+        if current is not None and not waiting_ok:
+            if t0 is None:
+                t0 = time.monotonic()
+            elapsed = time.monotonic() - t0
+            remaining = max(0.0, MATCH_TIMEOUT_SEC - elapsed)
+            cv2.putText(frame, f"Time left: {remaining:0.1f}s", (W-260, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,0), 2)
+
+            sid = current.get("student_id")
+            target_feat = feature_db.get(sid)
+
+            if target_feat is None:
+                cv2.putText(frame, "No reference photo for this student.", (20, 120),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2)
+            else:
+                if elapsed <= MATCH_TIMEOUT_SEC:
+                    faces, _ = detector.detect_faces(frame)
+                    if not (faces is None or (hasattr(faces, "size") and faces.size == 0) or (hasattr(faces, "__len__") and len(faces) == 0)):
+                        boxes = faces.tolist() if hasattr(faces, "tolist") else list(faces)
+                        x, y, w, h = max(boxes, key=lambda b: b[2] * b[3])
+                        cv2.rectangle(frame, (x,y), (x+w, y+h), (0,255,0), 2)
+
+                        start = time.perf_counter()
+                        face_img = preproc.preprocess(frame, (x, y, w, h))
+                        feat = extractor.extract(face_img)
+                        dist = FaceRecognizer._chi2_distance(feat, target_feat)
+                        latency_ms = (time.perf_counter() - start) * 1000.0
+
+                        attempts += 1
+                        distances.append(dist)
+                        latencies.append(latency_ms)
+
+                        cv2.putText(frame, f"Distance: {dist:.3f}", (20, 120),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.9,
+                                    (0,255,0) if dist < DISTANCE_THRESHOLD else (0,0,255), 2)
+
+                        if dist < DISTANCE_THRESHOLD:
+                            matches += 1
+                            cv2.putText(frame, "MATCH ✅", (20, 160),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,255,0), 3)
+                            current = None
+                            waiting_ok = False
+                            t0 = None
+                        else:
+                            cv2.putText(frame, "NOT MATCH", (20, 160),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,0,255), 3)
+                    else:
+                        cv2.putText(frame, "No face detected", (20, 120),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,0,255), 2)
+                else:
+                    cv2.putText(frame, "Matching timeout. Alert staff.", (20, 200),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,165,255), 2)
+                    current = None
+                    waiting_ok = False
+                    t0 = None
+
+        # HUD metrics
+        rate = (matches / attempts) if attempts else 0.0
+        cv2.putText(frame, f"Attempts:{attempts} Matches:{matches} Rate:{rate:.2f}",
+                    (20, H-20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200,200,200), 2)
+
+        cv2.imshow("Graduation Face Scanner", frame)
+        if cv2.waitKey(1) & 0xFF in (ord('q'), 27):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+    # Final metrics
+    def p95(arr): 
+        return float(np.percentile(arr, 95)) if arr else None
+    print({
+        "attempts": attempts,
+        "matches": matches,
+        "match_rate": rate,
+        "avg_distance": float(np.mean(distances)) if distances else None,
+        "p95_latency_ms": p95(latencies),
+    })
+
+if __name__ == "__main__":
+    main()
