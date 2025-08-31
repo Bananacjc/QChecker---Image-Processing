@@ -12,7 +12,6 @@ class QRGenerator():
             
             folder_path = "student_QR"
             filename = f"{student['student_id']}_QR.png"
-            student["image_path"] = 
             
             qr = qrcode.QRCode(version=1, error_correction=qrcode.ERROR_CORRECT_H,
                             box_size=10, border=4)
@@ -21,7 +20,7 @@ class QRGenerator():
             
             img = qr.make_image(fill_color="blue", back_color="white")
             
-            
+        
             self.saveToFolder(folder_path, filename, img)
            
     

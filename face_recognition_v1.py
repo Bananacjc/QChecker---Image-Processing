@@ -700,8 +700,6 @@ class FaceRecognizer:
     def _chi2_distance(a, b, eps=1e-10):
         return 0.5 * np.sum(((a - b) ** 2) / (a + b + eps))
     
-   
-
 class FacePipeline:
     def __init__(self, students, debug=False, augmenter= None, detector=None, extractor=None):
         self.preprocessor = FacePreprocessor(debug=debug)
@@ -851,7 +849,6 @@ class FaceComparator:
         # Decide match
         same = dist < self.threshold
         return {"distance": dist, "same_person": same}
-    
 
 if __name__ == '__main__':
     
@@ -872,5 +869,3 @@ if __name__ == '__main__':
     
     result = comparator.compare('./known_faces/24WMR09155.jpg', './known_faces/24WMR09155.jpg')
     print(result)
-
-    
