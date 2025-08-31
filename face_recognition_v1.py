@@ -115,6 +115,15 @@ def fetch_students(only_registered=None):
             "award": data.get("award", ""),
             "image_path": data.get("image_path", ""),
         })
+        
+    result.append({
+            "seat_num": "3",
+            "student_id": "24WMR09165",
+            "name": "Chong Zhen Yue",
+            "course": "RSW",
+            "award": "Distinction with Book Prize",
+            "image_path": "24WMR09165.png",
+        })
     return result
 
 def fetch_student_by_id(student_id: str):
@@ -298,20 +307,112 @@ class ViolaJonesDetector(Detector):
             
             return faces, (gray if self.debug else None)
 
+class HOGDetector(Detector):
+    def __init__(self, debug=False):
+        import dlib
+        self.hog_detector = dlib.get_frontal_face_detector()
+        self.debug = debug
+    
+    @property
+    def name(self):
+        return "HOG Face Detector"
+    
+    def detect_faces(self, frame):
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = self.hog_detector(gray, 1)
+        boxes = [(d.left(), d.top(), d.width(), d.height()) for d in faces]
+        return boxes, (gray if self.debug else None)
+
+class DNNDetector(Detector):
+    def __init__(self, prototxt, model, conf_threshold=0.5, debug=False):
+        self.net = cv2.dnn.readNetFromCaffe(prototxt, model)
+        self.conf_threshold = conf_threshold
+        self.debug = debug
+    
+    @property
+    def name(self):
+        return "DNN Face Detector"
+    
+    def detect_faces(self, frame):
+        h, w = frame.shape[:2]
+        blob = cv2.dnn.blobFromImage(frame, 1.0, (300, 300), [104, 117, 123], False, False)
+        self.net.setInput(blob)
+        detections = self.net.forward()
+        
+        boxes = []
+        for i in range(detections.shape[2]):
+            confidence = detections[0, 0, i, 2]
+            if confidence > self.conf_threshold:
+                box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
+                (x1, y1, x2, y2) = box.astype("int")
+                boxes.append((x1, y1, x2-x1, y2-y1))
+        return boxes, (frame if self.debug else None)
+
 class FacePreprocessor:
-    def __init__(self, size=(100, 100), normalize=True, debug=False):
+    def __init__(self, size=(100, 100), normalize=True, equalize=True, crop_tight=True, debug=False):
         self.size = size
         self.normalize = normalize
+        self.equalize = equalize
+        self.crop_tight = crop_tight
         self.debug = debug
+        self.eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_eye.xml")
+    
+    def _align_face(self, gray_face):
+        eyes = self.eye_cascade.detectMultiScale(gray_face, scaleFactor=1.1, minNeighbors=5)
+        if len(eyes) >= 2:
+            # Pick the two largest eyes
+            eyes = sorted(eyes, key=lambda e: e[2]*e[3], reverse=True)[:2]
+            eye_centers = [(x + w//2, y + h//2) for (x, y, w, h) in eyes]
+
+            # Ensure left & right order
+            eye_centers = sorted(eye_centers, key=lambda p: p[0])
+            left_eye, right_eye = eye_centers
+
+            # Compute angle
+            dy = right_eye[1] - left_eye[1]
+            dx = right_eye[0] - left_eye[0]
+            angle = np.degrees(np.arctan2(dy, dx))
+
+            # Compute scale (normalize eye distance to a fixed size)
+            dist = np.sqrt(dx**2 + dy**2)
+            desired_dist = self.size[0] * 0.4  # 40% of width
+            scale = desired_dist / dist
+
+            # Compute rotation matrix
+            eyes_center = ((left_eye[0] + right_eye[0]) // 2.0,
+                           (left_eye[1] + right_eye[1]) // 2.0)
+            M = cv2.getRotationMatrix2D(eyes_center, angle, scale)
+
+            # Apply affine transform
+            aligned = cv2.warpAffine(gray_face, M, self.size, flags=cv2.INTER_CUBIC)
+            return aligned
+
+        return None  # if no eyes found
         
     def preprocess(self, frame, face_box):
         x, y, w, h = face_box
         
         face = frame[y:y+h, x:x+w]
         
+        if self.crop_tight:
+            mx = int(0.1 * w)
+            my = int(0.1 * h)
+            x1 = max(0, mx)
+            y1 = max(0, my)
+            x2 = w - mx
+            y2 = h - my
+            face = face[y1:y2, x1:x2]
+        
         face = cv2.resize(face, self.size)
         
         face_gray = cv2.cvtColor(face, cv2.COLOR_BGR2GRAY)
+        
+        aligned = self._align_face(face_gray)
+        if aligned is not None:
+            face_gray = aligned
+        
+        if self.equalize:
+            face_gray = cv2.equalizeHist(face_gray)
         
         if self.normalize:
             face_gray = face_gray.astype("float32") / 255.0
@@ -328,7 +429,8 @@ class FeatureExtractor(ABC):
 
 class PCAFeatureExtractor(FeatureExtractor):
     '''
-    Simplest
+    Eigenfaces, Simplest, Sensitive to lightning & backgrounf\n
+    For complex data, use num_components=80-150\n
     '''
     def __init__(self, num_components=50):
         self.num_components = num_components
@@ -351,6 +453,12 @@ class PCAFeatureExtractor(FeatureExtractor):
         return np.dot(self.components, X_centered)
 
 class LDAFeatureExtractor(FeatureExtractor):
+    '''
+    Fisherfaces\n
+    More data is better\n
+    Can be combined with PCA to reduce noise
+    pca_components too small = loses info; Too big = overfits
+    '''
     def __init__(self, num_components=None):
         self.num_components = num_components
         self.projection_matrix = None
@@ -443,7 +551,11 @@ class FastLDAFeatureExtractor(FeatureExtractor):
         return x_lda
 
 class LBFFeatureExtractor:
-    def __init__(self, grid_x=8, grid_y=8):
+    '''
+    Robust to lightning, sentive to alignment and scale\n
+    small grid_x & grid_y capture more details
+    '''
+    def __init__(self, grid_x=16, grid_y=16):
         self.grid_x = grid_x
         self.grid_y = grid_y
     
@@ -489,10 +601,10 @@ class FaceRecognizer:
         # Fit PCA or LDA depending on extractor type
         if isinstance(self.extractor, PCAFeatureExtractor):
             self.extractor.fit(faces)
-            self.distance_func = self._euclidean
+            self.distance_func = self._chi2_distance
         elif isinstance(self.extractor, LDAFeatureExtractor) or isinstance(self.extractor, FastLDAFeatureExtractor):
             self.extractor.fit(faces, labels)
-            self.distance_func = self._euclidean
+            self.distance_func = self._chi2_distance
         elif isinstance(self.extractor, LBFFeatureExtractor):
             self.distance_func = self._chi2_distance
         else:
@@ -525,11 +637,12 @@ class FaceRecognizer:
                     intra_dists.append(d)
         
         if intra_dists:
-            self.threshold = max(intra_dists) * 1.2  # allow small margin
+            self.threshold = max(intra_dists) * 1.3 # allow small margin
         else:
             self.threshold = 0.3  # fallback
 
     def recognize(self, face_img):
+        
         if not self._trained or not self.database:
             return "Unknown"
 
@@ -545,6 +658,38 @@ class FaceRecognizer:
             self._update_threshold()
 
         return best_label if min_dist < self.threshold else "Unknown"
+    
+    def recognize_knn(self, face_img, k=3):
+        """Recognize a face using nearest neighbor (k=1) or kNN classification."""
+        if not self._trained or not self.database:
+            return "Unknown"
+
+        feat = self.extractor.extract(face_img)
+
+        # Compute all distances
+        distances = [(self.distance_func(feat, db_feat), label) 
+                     for db_feat, label in self.database]
+        distances.sort(key=lambda x: x[0])
+
+        if k == 1:
+            # --- Standard nearest neighbor ---
+            min_dist, best_label = distances[0]
+            if self.threshold is None:
+                self._update_threshold()
+            return best_label if min_dist < self.threshold else "Unknown"
+        else:
+            # --- kNN majority vote ---
+            top_k = distances[:k]
+            labels = [label for _, label in top_k]
+
+            # majority voting
+            best_label = max(set(labels), key=labels.count)
+
+            # check threshold with the closest neighbor
+            if self.threshold is None:
+                self._update_threshold()
+            return best_label if top_k[0][0] < self.threshold else "Unknown"
+        
 
     # --- Distance functions ---
     @staticmethod
@@ -554,6 +699,8 @@ class FaceRecognizer:
     @staticmethod
     def _chi2_distance(a, b, eps=1e-10):
         return 0.5 * np.sum(((a - b) ** 2) / (a + b + eps))
+    
+   
 
 class FacePipeline:
     def __init__(self, students, debug=False, augmenter= None, detector=None, extractor=None):
@@ -580,12 +727,12 @@ class FacePipeline:
             if faces is None:
                 print(f"No faces in {student['image_path']}")
                 continue
-
+            
             x, y, w, h = faces[0]
             face = self.preprocessor.preprocess(img, (x, y, w, h))
-            
+                
             augmented_faces = self.augmenter.augment(face)
-            
+                
             for aug in augmented_faces:
                 training_faces.append(aug)
                 training_labels.append(student['name'])
@@ -618,7 +765,8 @@ class FacePipeline:
                     if self.preprocessor.debug:
                         cv2.imshow("Preprocessed Face", face_img)
                         
-                    sid = self.recognizer.recognize(face_img)
+                    # Switch here
+                    sid = self.recognizer.recognize_knn(face_img, k=1)
                     
                     if sid != "Unknown":
                         info = next((d for d in self.students if d["name"] == sid), None)
@@ -643,14 +791,86 @@ class FacePipeline:
         cap.release()
         cv2.destroyAllWindows()
 
+# Classification (multi-class: person A, person B, …):
+# Accuracy – percentage of correctly classified faces.
+# Precision, Recall, F1-Score per class or macro-averaged.
+# Precision = “Of all predicted as person A, how many were correct?”
+# Recall = “Of all true person A, how many did we find?”
+# F1 = balance between precision & recall.
+# Confusion Matrix – shows which people are being mistaken for whom.
+
+# Verification (same/different person):
+# True Positive Rate (TPR / Recall / Sensitivity)
+# Probability that same-person pairs are accepted as same.
+# False Positive Rate (FPR)
+# Probability that different-person pairs are wrongly matched.
+# True Negative Rate (TNR / Specificity)
+# Opposite of FPR, probability different people are correctly rejected.
+# Precision – of all matches, how many were correct.
+# F1-score – same as above but treating “same” as positive class.
+# ROC Curve (Receiver Operating Characteristic)
+# Plot TPR vs FPR across different thresholds.
+# AUC (Area Under Curve) – threshold-independent measure of verification performance.
+# EER (Equal Error Rate) – the point where FPR = FNR (False Negative Rate). Lower EER = better.
+
+class FaceComparator:
+    def __init__(self, detector=None, extractor=None, preprocessor=None, threshold=0.3):
+        self.detector = detector or ViolaJonesDetector()
+        self.preprocessor = preprocessor or FacePreprocessor()
+        self.extractor = extractor or LBFFeatureExtractor()
+        self.threshold = threshold
+
+    def _get_face(self, img_path):
+        img = cv2.imread(img_path)
+        if img is None:
+            raise ValueError(f"Could not load image: {img_path}")
+        
+        faces, _ = self.detector.detect_faces(img)
+        if faces is None or len(faces) == 0:
+            raise ValueError(f"No face detected in {img_path}")
+        
+        x, y, w, h = faces[0]
+        face = self.preprocessor.preprocess(img, (x, y, w, h))
+        return face
+
+    def compare(self, img1_path, img2_path, use_chi2=True):
+        # Preprocess both
+        face1 = self._get_face(img1_path)
+        face2 = self._get_face(img2_path)
+
+        # Extract features
+        feat1 = self.extractor.extract(face1)
+        feat2 = self.extractor.extract(face2)
+
+        # Compute distance
+        if use_chi2:
+            dist = FaceRecognizer._chi2_distance(feat1, feat2)
+        else:
+            dist = FaceRecognizer._euclidean(feat1, feat2)
+
+        # Decide match
+        same = dist < self.threshold
+        return {"distance": dist, "same_person": same}
+    
+
 if __name__ == '__main__':
     
-    students = fetch_students(only_registered=True)
+    # students = fetch_students(only_registered=True)
     
-    
-    faceExtractor = LBFFeatureExtractor()
-    faceDetector = SkinSegmentationDetector()
-    system = FacePipeline(students, extractor=faceExtractor, detector=faceDetector)
+    # faceExtractor = LBFFeatureExtractor()
+    # faceDetector = ViolaJonesDetector()
+    # system = FacePipeline(students, extractor=faceExtractor, detector=faceDetector, debug=True)
    
-    system.run(camera_index=0)
+    # system.run(camera_index=1)
+    
+    comparator = FaceComparator(
+        detector=ViolaJonesDetector(),
+        extractor=LBFFeatureExtractor(),
+        preprocessor=FacePreprocessor(),
+        threshold=0.35
+    )
+    
+    result = comparator.compare('./known_faces/24WMR09155.jpg', './known_faces/24WMR09155.jpg')
+    print(result)
+
     
