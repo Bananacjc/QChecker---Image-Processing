@@ -1,12 +1,3 @@
-# flow_runner.py
-# ------------------------------------------------------------
-# All your classes are copied in FULL below (no logic changes).
-# Orchestrator at the bottom wires: camera -> fetch -> "train"
-# (precompute features) -> scan QR -> OK gesture -> timer ->
-# detect face -> compare only with that student's photo ->
-# show distance & match/not match with simple metrics.
-# ------------------------------------------------------------
-
 import os
 import cv2
 import json
@@ -670,7 +661,7 @@ class FastLDAFeatureExtractor(FeatureExtractor):
         x_lda = x_pca @ self.lda_projection
         return x_lda
 
-class LBFFeatureExtractor:
+class LBPFeatureExtractor:
     '''
     Robust to lightning, sentive to alignment and scale\n
     small grid_x & grid_y capture more details
@@ -707,7 +698,10 @@ class LBFFeatureExtractor:
                 hist, _ = np.histogram(patch, bins=256, range=(0, 256))
                 hist = hist.astype("float32") / (hist.sum() + 1e-6)
                 features.extend(hist)
-        return np.array(features)
+        
+        features = np.array(features)
+        features /= np.linalg.norm(features) + 1e-6
+        return features
 
 class FaceRecognizer:
     def __init__(self, extractor: 'FeatureExtractor' = None):
@@ -725,7 +719,7 @@ class FaceRecognizer:
         elif isinstance(self.extractor, LDAFeatureExtractor) or isinstance(self.extractor, FastLDAFeatureExtractor):
             self.extractor.fit(faces, labels)
             self.distance_func = self._chi2_distance
-        elif isinstance(self.extractor, LBFFeatureExtractor):
+        elif isinstance(self.extractor, LBPFeatureExtractor):
             self.distance_func = self._chi2_distance
         else:
             raise ValueError(f"Unknown extractor type: {type(self.extractor)}")
@@ -913,7 +907,7 @@ class FaceComparator:
     def __init__(self, detector=None, extractor=None, preprocessor=None, threshold=0.3):
         self.detector = detector or ViolaJonesDetector()
         self.preprocessor = preprocessor or FacePreprocessor()
-        self.extractor = extractor or LBFFeatureExtractor()
+        self.extractor = extractor or LBPFeatureExtractor()
         self.threshold = threshold
 
     def _get_face(self, img_path):
@@ -954,7 +948,7 @@ class FaceComparator:
 CAM_INDEX = 0
 OK_REQUIRED = True
 MATCH_TIMEOUT_SEC = 100.0
-DISTANCE_THRESHOLD = 0.35  # for LBF + chi2, tune with your data
+DISTANCE_THRESHOLD = 0.10  # for LBF + chi2, tune with your data
 
 def try_decode_qr(frame_bgr):
     """Use OpenCV QRCodeDetector (no pyzbar dependency)."""
@@ -1065,15 +1059,13 @@ def main():
     by_id = {s["student_id"]: s for s in students}
 
     print("Train (feature precompute)…")
-    detector = ViolaJonesDetector()
+    detector = ViolaJonesDetector(minSize=(100, 100))
     preproc  = FacePreprocessor()
-    extractor = PCAFeatureExtractor(num_components=50)
+    extractor = LBPFeatureExtractor(grid_x=7, grid_y=7)
     feature_db = build_feature_db(students, detector, preproc, extractor)
 
-    # Hand gesture recognizer (your model + rules)
     gesture_sys = HandGestureRecognizer(max_hands=2)
     gesture_sys.add_gesture(OKSignGesture(threshold=23))
-    # (optional) you can also add: gesture_sys.add_gesture(RudeGesture()); gesture_sys.add_gesture(ThumbsUpGesture())
 
     attempts = 0
     matches = 0
@@ -1119,7 +1111,7 @@ def main():
                 t0 = time.monotonic()
             elapsed = time.monotonic() - t0
             remaining = max(0.0, MATCH_TIMEOUT_SEC - elapsed)
-            cv2.putText(frame, f"Time left: {remaining:0.1f}s", (W-260, 40),
+            cv2.putText(frame, f"Time left: {remaining:0.1f}s", (W-260, 240),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,0), 2)
 
             sid = current.get("student_id")
@@ -1139,7 +1131,7 @@ def main():
                         start = time.perf_counter()
                         face_img = preproc.preprocess(frame, (x, y, w, h))
                         feat = extractor.extract(face_img)
-                        dist = FaceRecognizer._chi2_distance(feat, target_feat)
+                        dist = FaceRecognizer._chi2_distance(feat, target_feat) / 100
                         latency_ms = (time.perf_counter() - start) * 1000.0
 
                         attempts += 1
@@ -1150,25 +1142,25 @@ def main():
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.9,
                                     (0,255,0) if dist < DISTANCE_THRESHOLD else (0,0,255), 2)
 
-                        if dist < DISTANCE_THRESHOLD:
-                            matches += 1
-                            cv2.putText(frame, "MATCH ✅", (20, 160),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,255,0), 3)
-                            current = None
-                            waiting_ok = False
-                            t0 = None
-                        else:
-                            cv2.putText(frame, "NOT MATCH", (20, 160),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,0,255), 3)
-                    else:
-                        cv2.putText(frame, "No face detected", (20, 120),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,0,255), 2)
-                else:
-                    cv2.putText(frame, "Matching timeout. Alert staff.", (20, 200),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,165,255), 2)
-                    current = None
-                    waiting_ok = False
-                    t0 = None
+                #         if dist < DISTANCE_THRESHOLD:
+                #             matches += 1
+                #             cv2.putText(frame, "MATCH ✅", (20, 160),
+                #                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,255,0), 3)
+                #             current = None
+                #             waiting_ok = False
+                #             t0 = None
+                #         else:
+                #             cv2.putText(frame, "NOT MATCH", (20, 160),
+                #                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,0,255), 3)
+                #     else:
+                #         cv2.putText(frame, "No face detected", (20, 120),
+                #                     cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,0,255), 2)
+                # else:
+                #     cv2.putText(frame, "Matching timeout. Alert staff.", (20, 200),
+                #                 cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,165,255), 2)
+                #     current = None
+                #     waiting_ok = False
+                #     t0 = None
 
         # HUD metrics
         rate = (matches / attempts) if attempts else 0.0

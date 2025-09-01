@@ -849,7 +849,7 @@ if __name__ == '__main__':
     faceDetector = ViolaJonesDetector(minSize=(150, 150))
     system = FacePipeline(students, extractor=faceExtractor, detector=faceDetector, debug=True)
    
-    system.run(camera_index=0)
+    system.run(camera_index=1)
     
     # comparator = FaceComparator(
     #     detector=ViolaJonesDetector(),

@@ -91,7 +91,7 @@ class HandGestureRecognizer:
     def __init__(self, model_path="hand_landmarker.task", 
                  detection_conf=0.3, presence_conf=0.3, tracking_conf=0.3,
                  max_hands=1):
-        BaseOptions = mp.tasks.BaseOptions
+        BaseOptions= mp.tasks.BaseOptions
         HandLandmarker = mp.tasks.vision.HandLandmarker
         HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
         VisionRunningMode = mp.tasks.vision.RunningMode
