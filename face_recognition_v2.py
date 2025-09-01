@@ -1142,25 +1142,25 @@ def main():
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.9,
                                     (0,255,0) if dist < DISTANCE_THRESHOLD else (0,0,255), 2)
 
-                #         if dist < DISTANCE_THRESHOLD:
-                #             matches += 1
-                #             cv2.putText(frame, "MATCH ✅", (20, 160),
-                #                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,255,0), 3)
-                #             current = None
-                #             waiting_ok = False
-                #             t0 = None
-                #         else:
-                #             cv2.putText(frame, "NOT MATCH", (20, 160),
-                #                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,0,255), 3)
-                #     else:
-                #         cv2.putText(frame, "No face detected", (20, 120),
-                #                     cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,0,255), 2)
-                # else:
-                #     cv2.putText(frame, "Matching timeout. Alert staff.", (20, 200),
-                #                 cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,165,255), 2)
-                #     current = None
-                #     waiting_ok = False
-                #     t0 = None
+                        if dist < DISTANCE_THRESHOLD:
+                            matches += 1
+                            cv2.putText(frame, "MATCH ✅", (20, 160),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,255,0), 3)
+                            current = None
+                            waiting_ok = False
+                            t0 = None
+                        else:
+                            cv2.putText(frame, "NOT MATCH", (20, 160),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,0,255), 3)
+                    else:
+                        cv2.putText(frame, "No face detected", (20, 120),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,0,255), 2)
+                else:
+                    cv2.putText(frame, "Matching timeout. Alert staff.", (20, 200),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,165,255), 2)
+                    current = None
+                    waiting_ok = False
+                    t0 = None
 
         # HUD metrics
         rate = (matches / attempts) if attempts else 0.0
