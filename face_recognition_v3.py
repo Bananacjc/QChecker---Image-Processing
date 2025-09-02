@@ -954,6 +954,12 @@ CAM_INDEX = 0
 OK_REQUIRED = True
 MATCH_TIMEOUT_SEC = 8.0
 DISTANCE_THRESHOLD = 0.10  # tuned for your normalized LBP + chi2
+# --- Two-stage compare (LBP first, PCA fallback) ---
+LBP_DISTANCE_THRESHOLD = 0.10      # your current tuned value
+PCA_DISTANCE_THRESHOLD = 0.35      # start here; tune on your data
+PCA_COMPONENTS = 60                # 50–120 is usually fine
+PCA_TIMEOUT_SEC = 8.0              # how long to try PCA after LBP fails
+
 
 # ---- helpers ----
 def sort_by_seat(students):
@@ -1313,8 +1319,21 @@ def main():
     print("Train (feature precompute)…")
     detector = ViolaJonesDetector(minSize=(100,100))
     preproc  = FacePreprocessor()
-    extractor = LBPFeatureExtractor(grid_x=7, grid_y=7)
-    feature_db = build_feature_db(sequence, detector, preproc, extractor)
+
+    # --- Stage 1: LBP (fast) ---
+    extractor_lbp = LBPFeatureExtractor(grid_x=7, grid_y=7)
+    feature_db_lbp = build_feature_db(sequence, detector, preproc, extractor_lbp)
+
+    # --- Stage 2: PCA (fallback; precompute so switching is instant) ---
+    extractor_pca = PCAFeatureExtractor(num_components=PCA_COMPONENTS)
+    feature_db_pca = build_feature_db(sequence, detector, preproc, extractor_pca)
+
+    # --- Active extractor/DB (start with LBP) ---
+    using_pca = False
+    extractor = extractor_lbp
+    feature_db = feature_db_lbp
+    dist_thresh = LBP_DISTANCE_THRESHOLD
+    active_timeout_sec = MATCH_TIMEOUT_SEC
 
     gesture_sys = HandGestureRecognizer(max_hands=2)
     gesture_sys.add_gesture(OKSignGesture(threshold=23))
@@ -1386,6 +1405,15 @@ def main():
                                      f"({scanned.get('name','?')}). Press Force to accept anyway.")
                             cv2.putText(frame, "Seat mismatch. Please wait for staff.", (20, 80),
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2)
+                            # keep waiting for the correct student and ensure we’re in LBP
+                            using_pca = False
+                            extractor = extractor_lbp
+                            feature_db = feature_db_lbp
+                            dist_thresh = LBP_DISTANCE_THRESHOLD
+                            active_timeout_sec = MATCH_TIMEOUT_SEC
+                            t0 = None
+                            waiting_ok = False
+                            current_scan = None
                         else:
                             current_scan = scanned
                             waiting_ok = OK_REQUIRED
@@ -1414,8 +1442,9 @@ def main():
             if t0 is None:
                 t0 = time.monotonic()
             elapsed = time.monotonic() - t0
+
             sid = current_scan.get("student_id")
-            ref = feature_db.get(sid)
+            ref = feature_db.get(sid)          # uses the ACTIVE DB (LBP or PCA)
             if ref is not None:
                 faces, _ = detector.detect_faces(frame)
                 empty = (faces is None or len(faces) == 0)
@@ -1425,7 +1454,7 @@ def main():
 
                     t_start = time.perf_counter()
                     face_img = preproc.preprocess(frame, (x, y, w, h))
-                    feat = extractor.extract(face_img)
+                    feat = extractor.extract(face_img)  # ACTIVE extractor
                     dist = FaceRecognizer._chi2_distance(feat, ref)
                     latency_ms = (time.perf_counter() - t_start) * 1000.0
 
@@ -1433,18 +1462,56 @@ def main():
                     distances.append(dist)
                     latencies.append(latency_ms)
 
-                    if dist < DISTANCE_THRESHOLD:
+                    if dist < dist_thresh:
+                        # --- success ---
                         matches += 1
                         queue.append(current_scan)
                         show_match_banner_until = time.monotonic() + 2.5
                         banner_text = "Face matched. Please proceed"
+
+                        # advance expected pointer
+                        if expected:
+                            if expected.get("student_id") == sid:
+                                # normal case: matched the expected person
+                                idx = min(idx + 1, total_seq)
+                            else:
+                                # (optional) realign if the matched person is later in the list
+                                try:
+                                    pos = next(i for i, s in enumerate(sequence)
+                                            if s.get("student_id") == sid)
+                                    idx = min(pos + 1, total_seq)
+                                except StopIteration:
+                                    # if not found in sequence, leave idx as-is
+                                    pass
+                        else:
+                            # if there was no expected (end of list), keep idx as-is
+                            pass
+
+                        # reset state for next student (return to LBP)
                         current_scan = None
                         waiting_ok = False
                         t0 = None
                         alert = None
                         timeout_announced = False
+                        using_pca = False
+                        extractor = extractor_lbp
+                        feature_db = feature_db_lbp
+                        dist_thresh = LBP_DISTANCE_THRESHOLD
+                        active_timeout_sec = MATCH_TIMEOUT_SEC
                     else:
-                        if (elapsed > MATCH_TIMEOUT_SEC) and (not timeout_announced):
+                        # --- not matched yet; decide if we switch or time out ---
+                        if (not using_pca) and (elapsed > MATCH_TIMEOUT_SEC):
+                            # switch to PCA fallback
+                            using_pca = True
+                            extractor = extractor_pca
+                            feature_db = feature_db_pca
+                            dist_thresh = PCA_DISTANCE_THRESHOLD
+                            active_timeout_sec = PCA_TIMEOUT_SEC
+                            t0 = time.monotonic()           # restart timer for PCA pass
+                            alert = "No match yet. Auto fallback to PCA extractor…"
+                            timeout_announced = False       # reset announcement for PCA round
+
+                        elif using_pca and (elapsed > active_timeout_sec) and (not timeout_announced):
                             alert = "Match timeout. Press Force to accept, or keep comparing."
                             timeout_announced = True
 
@@ -1455,8 +1522,17 @@ def main():
         elif cmd == "skip":
             if expected:
                 idx = min(idx+1, total_seq)
-                alert = None
-                timeout_announced = False
+            # full reset & return to LBP
+            current_scan = None
+            waiting_ok = False
+            t0 = None
+            alert = None
+            timeout_announced = False
+            using_pca = False
+            extractor = extractor_lbp
+            feature_db = feature_db_lbp
+            dist_thresh = LBP_DISTANCE_THRESHOLD
+            active_timeout_sec = MATCH_TIMEOUT_SEC
         elif cmd == "force":
             target = current_scan if current_scan is not None else expected
             if target is not None:
@@ -1465,11 +1541,17 @@ def main():
                 banner_text = "MATCH. Enqueued (Forced)"
                 if expected:
                     idx = min(idx+1, total_seq)
+                # full reset & return to LBP
                 current_scan = None
                 waiting_ok = False
                 t0 = None
                 alert = None
                 timeout_announced = False
+                using_pca = False
+                extractor = extractor_lbp
+                feature_db = feature_db_lbp
+                dist_thresh = LBP_DISTANCE_THRESHOLD
+                active_timeout_sec = MATCH_TIMEOUT_SEC
         elif cmd == "call":
             if queue and not speaking_now.is_set():
                 called = queue[0]  # peek
