@@ -691,9 +691,8 @@ class LBPFeatureExtractor:
         return lbp_img
     
     def extract(self, face_img: np.ndarray) -> np.ndarray:
-        from skimage.feature import local_binary_pattern
         h, w = face_img.shape
-        lbp_img = local_binary_pattern(face_img, P=8, R=1, method='uniform')
+        lbp_img = self._lbp((face_img * 255).astype(np.uint8))
         grid_h, grid_w = h // self.grid_y, w // self.grid_x
         features = []
         for i in range(self.grid_y):
