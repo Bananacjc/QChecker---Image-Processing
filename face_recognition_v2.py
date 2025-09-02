@@ -691,7 +691,7 @@ class LBPFeatureExtractor:
         for i in range(self.grid_y):
             for j in range(self.grid_x):
                 patch = lbp_img[i*grid_h:(i+1)*grid_h, j*grid_w:(j+1)*grid_w]
-                hist, _ = np.histogram(patch, bins=256, range=(0, 256))
+                hist, _ = np.histogram(patch, bins=np.arange(0, 27), range=(0, 256))
                 hist = hist.astype("float32") / (hist.sum() + 1e-6)
                 features.extend(hist)
         
