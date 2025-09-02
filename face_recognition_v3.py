@@ -16,7 +16,6 @@ import tkinter as tk
 from tkinter import ttk
 from tkinter import messagebox
 from PIL import Image, ImageTk
-import pyttsx3
 import queue as pyqueue
 
 # HAND GESTURE
@@ -1231,37 +1230,73 @@ def main():
     if not cap.isOpened():
         raise RuntimeError("Cannot open camera.")
 
-    # --- Speech system (one engine only) ---
+    # --- Speech system (PowerShell-based TTS; robust on Windows) ---
     speaking_now = threading.Event()
     speech_q = pyqueue.Queue()
+
     def tts_worker():
-        import pyttsx3, time
-        MIN_SPEAK_SECONDS = 0.35  # treat instant returns as failure/silence
+        import sys, subprocess
+        is_windows = sys.platform.startswith('win')
         while True:
             item = speech_q.get()
             if item is None:
-                break
+                break  # shutdown
             text, cb = item if isinstance(item, tuple) else (item, None)
+
             ok = False
             try:
-                start = time.time()
-                eng = pyttsx3.init(driverName='sapi5')
-                eng.setProperty('rate', 165)
-                eng.setProperty('volume', 1.0)
-                eng.say(text)
-                eng.runAndWait()
-                ok = (time.time() - start) >= MIN_SPEAK_SECONDS
+                if is_windows:
+                    # Escape single quotes for PowerShell
+                    ps_text = (text or "").replace("'", "''")
+                    ps_script = (
+                        "Add-Type -AssemblyName System.Speech; "
+                        "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+                        "$s.Rate = 0; $s.Volume = 100; "
+                        "$v = ($s.GetInstalledVoices() | Where-Object { $_.VoiceInfo.Name -like '*Zira*' })[0]; "
+                        "if ($v) { $s.SelectVoice($v.VoiceInfo.Name) }; "
+                        f"$s.Speak('{ps_text}')"
+                    )
+                    # Run without spawning a console window
+                    creationflags = 0
+                    startupinfo = None
+                    try:
+                        import subprocess as sp
+                        creationflags = sp.CREATE_NO_WINDOW  # type: ignore[attr-defined]
+                    except Exception:
+                        pass
+                    subprocess.run(
+                        ["powershell", "-NoProfile", "-Command", ps_script],
+                        check=True,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        creationflags=creationflags,
+                        startupinfo=startupinfo,
+                    )
+                    ok = True
+                else:
+                    # Fallbacks for other OSes (no-ops if not installed)
+                    try:
+                        subprocess.run(["say", text], check=True)  # macOS
+                        ok = True
+                    except Exception:
+                        try:
+                            subprocess.run(["espeak", text], check=True)  # Linux
+                            ok = True
+                        except Exception:
+                            print("[TTS] No supported TTS backend on this OS.")
+                            ok = False
             except Exception as e:
                 print("[TTS error]", e)
                 ok = False
             finally:
-                try:
-                    if cb:
+                if cb:
+                    try:
                         cb(success=ok)
-                except Exception:
-                    pass
+                    except Exception:
+                        pass
                 speech_q.task_done()
 
+    # Start worker once at app start
     threading.Thread(target=tts_worker, daemon=True).start()
 
     def enqueue_tts(text, cb=None):
@@ -1437,16 +1472,15 @@ def main():
                 timeout_announced = False
         elif cmd == "call":
             if queue and not speaking_now.is_set():
-                called = queue[0]  # peek; don't pop yet
+                called = queue[0]  # peek
                 name  = called.get("name","(unknown)")
                 award = called.get("award","")
 
-                speaking_now.set()  # lock immediately so spam-clicks are ignored
+                speaking_now.set()
                 print(f"[CALL] {name} — {award}")
 
                 def after_speak(success=True):
                     try:
-                        # pop only if we actually spoke and the same student is still at front
                         if success and queue and queue[0] is called:
                             queue.popleft()
                     finally:
