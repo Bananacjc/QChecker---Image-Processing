@@ -957,7 +957,6 @@ MATCH_TIMEOUT_SEC = 10.0
 LBP_DISTANCE_THRESHOLD = 0.10      # your current tuned value
 PCA_DISTANCE_THRESHOLD = 0.35      # start here; tune on your data
 PCA_COMPONENTS = 60                # 50–120 is usually fine
-PCA_TIMEOUT_SEC = 8.0              # how long to try PCA after LBP fails
 
 
 # ---- helpers ----
