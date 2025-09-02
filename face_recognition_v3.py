@@ -953,7 +953,6 @@ from collections import deque
 CAM_INDEX = 0
 OK_REQUIRED = True
 MATCH_TIMEOUT_SEC = 8.0
-DISTANCE_THRESHOLD = 0.10  # tuned for your normalized LBP + chi2
 # --- Two-stage compare (LBP first, PCA fallback) ---
 LBP_DISTANCE_THRESHOLD = 0.10      # your current tuned value
 PCA_DISTANCE_THRESHOLD = 0.35      # start here; tune on your data
