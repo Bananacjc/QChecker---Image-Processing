@@ -691,8 +691,9 @@ class LBPFeatureExtractor:
         return lbp_img
     
     def extract(self, face_img: np.ndarray) -> np.ndarray:
+        from skimage.feature import local_binary_pattern
         h, w = face_img.shape
-        lbp_img = self._lbp((face_img * 255).astype(np.uint8))
+        lbp_img = local_binary_pattern(face_img, P=8, R=1, method='uniform')
         grid_h, grid_w = h // self.grid_y, w // self.grid_x
         features = []
         for i in range(self.grid_y):
@@ -952,7 +953,7 @@ from collections import deque
 
 CAM_INDEX = 0
 OK_REQUIRED = True
-MATCH_TIMEOUT_SEC = 8.0
+MATCH_TIMEOUT_SEC = 10.0
 # --- Two-stage compare (LBP first, PCA fallback) ---
 LBP_DISTANCE_THRESHOLD = 0.10      # your current tuned value
 PCA_DISTANCE_THRESHOLD = 0.35      # start here; tune on your data
@@ -1316,7 +1317,7 @@ def main():
     by_id = {s["student_id"]: s for s in all_students}
 
     print("Train (feature precompute)…")
-    detector = ViolaJonesDetector(minSize=(100,100))
+    detector = ViolaJonesDetector(minSize=(150,150))
     preproc  = FacePreprocessor()
 
     # --- Stage 1: LBP (fast) ---
@@ -1332,7 +1333,6 @@ def main():
     extractor = extractor_lbp
     feature_db = feature_db_lbp
     dist_thresh = LBP_DISTANCE_THRESHOLD
-    active_timeout_sec = MATCH_TIMEOUT_SEC
 
     gesture_sys = HandGestureRecognizer(max_hands=2)
     gesture_sys.add_gesture(OKSignGesture(threshold=23))
@@ -1350,6 +1350,7 @@ def main():
     # success banner
     show_match_banner_until = 0.0
     banner_text = ""
+    ok_gate_open = False
 
     # --- Staff panel ---
     panel = StaffPanelTk(title="Graduation Staff Panel")
@@ -1409,7 +1410,6 @@ def main():
                             extractor = extractor_lbp
                             feature_db = feature_db_lbp
                             dist_thresh = LBP_DISTANCE_THRESHOLD
-                            active_timeout_sec = MATCH_TIMEOUT_SEC
                             t0 = None
                             waiting_ok = False
                             current_scan = None
@@ -1418,11 +1418,15 @@ def main():
                             waiting_ok = OK_REQUIRED
                             t0 = None
                             timeout_announced = False
+                            ok_gate_open = False
+                            gesture_sys.last_result = None
                     else:
                         current_scan = scanned
                         waiting_ok = OK_REQUIRED
                         t0 = None
                         timeout_announced = False
+                        ok_gate_open = False
+                        gesture_sys.last_result = None
 
         else:
             cv2.putText(frame,
@@ -1431,10 +1435,21 @@ def main():
 
         # --- Step 2: OK gesture ---
         if current_scan is not None and waiting_ok:
-            if detect_ok_sign(gesture_sys, frame):
+            is_ok_now = detect_ok_sign(gesture_sys, frame)
+
+            # Open the gate only after we've seen at least one non-OK frame
+            if not is_ok_now:
+                ok_gate_open = True
+
+            # Accept OK only on a rising edge (non-OK -> OK)
+            if is_ok_now and ok_gate_open:
                 waiting_ok = False
                 t0 = time.monotonic()
                 timeout_announced = False
+
+                # reset for safety
+                ok_gate_open = False
+                gesture_sys.last_result = None
 
         # --- Step 3: Face compare ---
         if current_scan is not None and not waiting_ok:
@@ -1496,23 +1511,19 @@ def main():
                         extractor = extractor_lbp
                         feature_db = feature_db_lbp
                         dist_thresh = LBP_DISTANCE_THRESHOLD
-                        active_timeout_sec = MATCH_TIMEOUT_SEC
+                        ok_gate_open = False
+                        gesture_sys.last_result = None
                     else:
-                        # --- not matched yet; decide if we switch or time out ---
                         if (not using_pca) and (elapsed > MATCH_TIMEOUT_SEC):
-                            # switch to PCA fallback
                             using_pca = True
                             extractor = extractor_pca
                             feature_db = feature_db_pca
                             dist_thresh = PCA_DISTANCE_THRESHOLD
-                            active_timeout_sec = PCA_TIMEOUT_SEC
-                            t0 = time.monotonic()           # restart timer for PCA pass
-                            alert = "No match yet. Auto fallback to PCA extractor…"
-                            timeout_announced = False       # reset announcement for PCA round
-
-                        elif using_pca and (elapsed > active_timeout_sec) and (not timeout_announced):
-                            alert = "Match timeout. Press Force to accept, or keep comparing."
-                            timeout_announced = True
+                            t0 = time.monotonic()           # keep if you still want elapsed stats
+                            alert = "No match yet. Fallback to PCA (no timeout)."
+                            timeout_announced = False
+                            ok_gate_open = False
+                            gesture_sys.last_result = None
 
         # --- Staff Panel commands ---
         cmd = panel.get_command_nowait()
@@ -1531,7 +1542,8 @@ def main():
             extractor = extractor_lbp
             feature_db = feature_db_lbp
             dist_thresh = LBP_DISTANCE_THRESHOLD
-            active_timeout_sec = MATCH_TIMEOUT_SEC
+            ok_gate_open = False
+            gesture_sys.last_result = None
         elif cmd == "force":
             target = current_scan if current_scan is not None else expected
             if target is not None:
@@ -1550,7 +1562,8 @@ def main():
                 extractor = extractor_lbp
                 feature_db = feature_db_lbp
                 dist_thresh = LBP_DISTANCE_THRESHOLD
-                active_timeout_sec = MATCH_TIMEOUT_SEC
+                ok_gate_open = False
+                gesture_sys.last_result = None
         elif cmd == "call":
             if queue and not speaking_now.is_set():
                 called = queue[0]  # peek
