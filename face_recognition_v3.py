@@ -10,6 +10,14 @@ from abc import ABC, abstractmethod
 import firebase_admin
 from firebase_admin import credentials, firestore
 from dotenv import load_dotenv
+import threading
+import queue
+import tkinter as tk
+from tkinter import ttk
+from tkinter import messagebox
+from PIL import Image, ImageTk
+import pyttsx3
+import queue as pyqueue
 
 # HAND GESTURE
 class HandGesture(ABC):
@@ -939,18 +947,30 @@ class FaceComparator:
         return {"distance": dist, "same_person": same}
 
 # ===========================
-# ORCHESTRATOR (flow) — uses your classes; no logic changes inside them
+# ORCHESTRATOR (ceremony flow)
 # ===========================
+from collections import deque
+
 CAM_INDEX = 0
 OK_REQUIRED = True
-MATCH_TIMEOUT_SEC = 100.0
-DISTANCE_THRESHOLD = 0.10  # for LBF + chi2, tune with your data
+MATCH_TIMEOUT_SEC = 8.0
+DISTANCE_THRESHOLD = 0.10  # tuned for your normalized LBP + chi2
+
+# ---- helpers ----
+def sort_by_seat(students):
+    def _to_int(s):
+        try: return int(s.get("seat_num", 0))
+        except: return 0
+    return sorted(students, key=_to_int)
 
 def try_decode_qr(frame_bgr):
-    """Use OpenCV QRCodeDetector (no pyzbar dependency)."""
     qr = cv2.QRCodeDetector()
-    data, pts, _ = qr.detectAndDecode(frame_bgr)
-    if pts is not None and data:
+    try:
+        data, pts, _ = qr.detectAndDecode(frame_bgr)
+    except cv2.error:
+        return None
+    
+    if pts is not None and len(pts) > 0 and data:
         try:
             return json.loads(data)
         except Exception:
@@ -958,21 +978,8 @@ def try_decode_qr(frame_bgr):
     return None
 
 def build_feature_db(students, detector, preproc, extractor):
-    """
-    Precompute features from ./known_faces/<image_path> for each student.
-
-    Works for:
-      - LBFFeatureExtractor (no fitting needed)
-      - PCAFeatureExtractor (calls fit(faces))
-      - LDAFeatureExtractor / FastLDAFeatureExtractor (calls fit(faces, labels))
-    """
-    # First pass: collect one preprocessed face per student (if available)
-    per_student_face = {}   # sid -> face_img (normalized grayscale)
-    train_faces = []        # list of face imgs for fitting
-    lda_labels = []         # numeric labels for LDA (if needed)
-    label_map = {}          # sid -> int label (for LDA)
-    ok_cnt, miss_cnt = 0, 0
-
+    per_face = {}
+    ok_cnt = miss_cnt = 0
     for s in students:
         sid = s.get("student_id", "")
         img_path = os.path.join("./known_faces", s.get("image_path", ""))
@@ -981,7 +988,6 @@ def build_feature_db(students, detector, preproc, extractor):
             print(f"[train] Missing image: {img_path}")
             miss_cnt += 1
             continue
-
         faces, _ = detector.detect_faces(img)
         empty = (faces is None or
                  (hasattr(faces, "size") and faces.size == 0) or
@@ -990,195 +996,499 @@ def build_feature_db(students, detector, preproc, extractor):
             print(f"[train] No face detected: {img_path}")
             miss_cnt += 1
             continue
-
         boxes = faces.tolist() if hasattr(faces, "tolist") else list(faces)
         x, y, w, h = max(boxes, key=lambda b: b[2] * b[3])
         face = preproc.preprocess(img, (x, y, w, h))
-
-        # Save one normalized face per student for later feature extraction
-        per_student_face[sid] = face
+        per_face[sid] = face
         ok_cnt += 1
 
-    # If the extractor needs fitting, do it once using all collected faces
-    if isinstance(extractor, PCAFeatureExtractor):
-        if not per_student_face:
-            print("[train] No faces found; PCA fit skipped.")
-        else:
-            train_faces = list(per_student_face.values())
-            extractor.fit(train_faces)
+    if isinstance(extractor, PCAFeatureExtractor) and per_face:
+        extractor.fit(list(per_face.values()))
+    elif isinstance(extractor, (LDAFeatureExtractor, FastLDAFeatureExtractor)) and per_face:
+        sids = list(per_face.keys())
+        lbl_map = {sid:i for i, sid in enumerate(sids)}
+        faces = [per_face[sid] for sid in sids]
+        labels = [lbl_map[sid] for sid in sids]
+        extractor.fit(faces, labels)
 
-    elif isinstance(extractor, (LDAFeatureExtractor, FastLDAFeatureExtractor)):
-        if not per_student_face:
-            print("[train] No faces found; LDA fit skipped.")
-        else:
-            # Build stable numeric labels for LDA
-            sids = list(per_student_face.keys())
-            label_map = {sid: i for i, sid in enumerate(sids)}
-            train_faces = [per_student_face[sid] for sid in sids]
-            lda_labels = [label_map[sid] for sid in sids]
-            extractor.fit(train_faces, lda_labels)
-
-    # Second pass: extract features for each student’s saved face
-    db = {}
-    for sid, face in per_student_face.items():
-        feat = extractor.extract(face)
-        db[sid] = feat
-
+    db = {sid: extractor.extract(face) for sid, face in per_face.items()}
     print(f"[train] Features ready for {ok_cnt} students; {miss_cnt} skipped.")
     return db
 
-
 def detect_ok_sign(gesture_sys, frame_bgr):
-    """Run your mediapipe hand landmarker + gesture rules; return True if OK Sign found."""
     H, W = frame_bgr.shape[:2]
     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_bgr)
     ts = int(cv2.getTickCount() / cv2.getTickFrequency() * 1000)
     gesture_sys.landmarker.detect_async(mp_image, ts)
-
-    if gesture_sys.last_result and gesture_sys.last_result.hand_landmarks:
+    if gesture_sys.last_result and hasattr(gesture_sys.last_result, "hand_landmarks") and gesture_sys.last_result.hand_landmarks:
         for hand_landmarks in gesture_sys.last_result.hand_landmarks:
             landmarks = [(int(lm.x * W), int(lm.y * H)) for lm in hand_landmarks]
             gesture_sys.draw(landmarks, frame_bgr)
-            name = gesture_sys.detect_gesture(landmarks)
-            if name == "OK Sign":
+            if gesture_sys.detect_gesture(landmarks) == "OK Sign":
                 return True
     return False
 
+# STAFF PANEL
+class StaffPanelTk:
+    """
+    Tiny Tkinter panel that runs in its own thread.
+    Buttons enqueue commands: 'force', 'skip', 'call', 'quit'
+    update_status(...) updates the UI; get_command_nowait() polls commands.
+    """
+    def __init__(self, title="Staff Panel"):
+        import threading, queue, tkinter as tk
+        from tkinter import ttk, messagebox
+
+        self.tk = tk
+        self.ttk = ttk
+        self.messagebox = messagebox
+        self._title = title
+        self._cmd_q: "queue.Queue[str]" = queue.Queue()
+        self._alive = True
+
+        # photo support
+        self.photo_label = None
+        self.photo_cache = None
+        self._btn_call = None
+
+        # status snapshot for UI thread
+        self._status_lock = threading.Lock()
+        self._status = {
+            "expected": "(none)",
+            "index": 0,
+            "total": 0,
+            "alert": "",
+            "next_hint": "",
+            "queue_preview": [],
+            "expected_id": None
+        }
+
+        self._thread = threading.Thread(target=self._run_tk, daemon=True)
+        self._thread.start()
+
+    # ---- public API ----
+    def update_status(self, expected, idx, total, q, alert_text=None, next_hint=None):
+        """Called from the OpenCV thread each frame."""
+        preview = []
+        for i, s in enumerate(list(q)[:5]):  # show first 5 in queue
+            preview.append(f"{i+1}. Seat {s.get('seat_num','?')} — {s.get('name','?')} — {s.get('award','')}")
+
+        exp_str = "(none)"
+        exp_id = None
+        if expected:
+            exp_str = f"Seat {expected.get('seat_num','?')} — {expected.get('name','?')}"
+            exp_id = expected.get("student_id")
+
+        with self._status_lock:
+            self._status.update({
+                "expected": exp_str,
+                "expected_id": exp_id,
+                "index": int(idx),
+                "total": int(total),
+                "alert": alert_text or "",
+                "next_hint": next_hint or "",
+                "queue_preview": preview
+            })
+
+    def get_command_nowait(self):
+        try:
+            return self._cmd_q.get_nowait()
+        except Exception:
+            return None
+
+    def shutdown(self):
+        self._alive = False
+
+    # Exposed helper: enable/disable the Call button (thread-safe)
+    def set_call_enabled(self, enabled: bool):
+        try:
+            def _apply():
+                if not self._btn_call: return
+                if enabled:
+                    self._btn_call.state(["!disabled"])
+                else:
+                    self._btn_call.state(["disabled"])
+            self._root.after(0, _apply)
+        except Exception:
+            pass
+
+    # ---- UI thread ----
+    def _on_quit_clicked(self):
+        if self.messagebox.askyesno("Confirm", "Quit the system?"):
+            self._cmd_q.put("quit")
+
+    def _run_tk(self):
+        tk = self.tk
+        ttk = self.ttk
+
+        self._root = tk.Tk()
+        self._root.title(self._title)
+        self._root.attributes("-topmost", True)
+        self._root.protocol("WM_DELETE_WINDOW", self._on_quit_clicked)
+
+        # Vars
+        self.var_expected = tk.StringVar(value="Expected: (none)")
+        self.var_index    = tk.StringVar(value="Index: 0/0")
+        self.var_next     = tk.StringVar(value="Next: -")
+        self.var_alert    = tk.StringVar(value="")
+
+        # Layout
+        frm = ttk.Frame(self._root, padding=10)
+        frm.grid(row=0, column=0, sticky="nsew")
+        self._root.columnconfigure(0, weight=1)
+        self._root.rowconfigure(0, weight=1)
+
+        lbl_title = ttk.Label(frm, text="== Staff Panel ==", font=("Segoe UI", 12, "bold"))
+        lbl_title.grid(row=0, column=0, columnspan=5, sticky="w", pady=(0,6))
+
+        ttk.Label(frm, textvariable=self.var_expected).grid(row=1, column=0, columnspan=5, sticky="w")
+        ttk.Label(frm, textvariable=self.var_index).grid(row=2, column=0, columnspan=5, sticky="w")
+        ttk.Label(frm, textvariable=self.var_next).grid(row=3, column=0, columnspan=5, sticky="w")
+
+        # Expected student photo
+        self.photo_label = ttk.Label(frm, text="(No image)")
+        self.photo_label.grid(row=4, column=0, columnspan=5, pady=(8,0))
+
+        # Queue list
+        ttk.Label(frm, text="Queue (first 5):").grid(row=5, column=0, columnspan=5, sticky="w", pady=(8,0))
+        self.list_queue = tk.Listbox(frm, height=5)
+        self.list_queue.grid(row=6, column=0, columnspan=5, sticky="nsew")
+
+        # Buttons row
+        btns = [
+            ("Force",   "force"),
+            ("Skip",    "skip"),
+            ("Call next","call"),
+            ("Quit",    "quit"),
+        ]
+        for i, (txt, cmd) in enumerate(btns):
+            if cmd == "quit":
+                action = self._on_quit_clicked
+            else:
+                action = lambda c=cmd: self._cmd_q.put(c)
+            b = ttk.Button(frm, text=txt, command=action)
+            b.grid(row=7, column=i, padx=2, pady=(10,0), sticky="ew")
+            if cmd == "call":
+                self._btn_call = b
+
+        # Alert (in red)
+        lbl_alert = ttk.Label(frm, textvariable=self.var_alert, foreground="#cc0000", font=("Segoe UI", 10, "bold"))
+        lbl_alert.grid(row=8, column=0, columnspan=5, sticky="w", pady=(8,0))
+
+        # Expand
+        for i in range(5):
+            frm.columnconfigure(i, weight=1)
+        frm.rowconfigure(6, weight=1)
+
+        self._tick()
+        self._root.mainloop()
+
+    def _tick(self):
+        if not self._alive:
+            try:
+                self._root.destroy()
+            except Exception:
+                pass
+            return
+
+        with self._status_lock:
+            s = dict(self._status)
+
+        self.var_expected.set(f"Expected: {s['expected']}")
+        self.var_index.set(f"Index: {s['index']+1}/{s['total']}")
+        self.var_next.set(f"Next: {s['next_hint'] or '-'}")
+        self.var_alert.set(f"ALERT: {s['alert']}" if s['alert'] else "")
+
+        # Update queue list
+        self.list_queue.delete(0, self.tk.END)
+        for line in s["queue_preview"]:
+            self.list_queue.insert(self.tk.END, line)
+
+        # Update expected photo
+        exp_id = s.get("expected_id")
+        if exp_id:
+            path = os.path.join("./known_faces", f"{exp_id}.png")
+            if os.path.exists(path):
+                try:
+                    from PIL import Image
+                    img = Image.open(path).resize((120, 150))
+                    from PIL import ImageTk
+                    self.photo_cache = ImageTk.PhotoImage(img)
+                    self.photo_label.configure(image=self.photo_cache, text="")
+                except Exception:
+                    self.photo_label.configure(image="", text="(No image)")
+            else:
+                self.photo_label.configure(image="", text="(No image)")
+        else:
+            self.photo_label.configure(image="", text="(No image)")
+
+        self._root.after(150, self._tick)
+
+# MAIN CEREMONY APP
 def main():
     print("Camera starting…")
     cap = cv2.VideoCapture(CAM_INDEX)
     if not cap.isOpened():
         raise RuntimeError("Cannot open camera.")
 
+    # --- Speech system (one engine only) ---
+    speaking_now = threading.Event()
+    speech_q = pyqueue.Queue()
+    def tts_worker():
+        import pyttsx3, time
+        MIN_SPEAK_SECONDS = 0.35  # treat instant returns as failure/silence
+        while True:
+            item = speech_q.get()
+            if item is None:
+                break
+            text, cb = item if isinstance(item, tuple) else (item, None)
+            ok = False
+            try:
+                start = time.time()
+                eng = pyttsx3.init(driverName='sapi5')
+                eng.setProperty('rate', 165)
+                eng.setProperty('volume', 1.0)
+                eng.say(text)
+                eng.runAndWait()
+                ok = (time.time() - start) >= MIN_SPEAK_SECONDS
+            except Exception as e:
+                print("[TTS error]", e)
+                ok = False
+            finally:
+                try:
+                    if cb:
+                        cb(success=ok)
+                except Exception:
+                    pass
+                speech_q.task_done()
+
+    threading.Thread(target=tts_worker, daemon=True).start()
+
+    def enqueue_tts(text, cb=None):
+        speech_q.put((text, cb))
+
     print("Fetch students…")
-    students = fetch_students(only_registered=None)
-    by_id = {s["student_id"]: s for s in students}
+    sequence = sort_by_seat(fetch_students(only_registered=True))
+    total_seq = len(sequence)
+    idx = 0
+
+    all_students = fetch_students(only_registered=None)
+    by_id = {s["student_id"]: s for s in all_students}
 
     print("Train (feature precompute)…")
-    detector = ViolaJonesDetector(minSize=(100, 100))
+    detector = ViolaJonesDetector(minSize=(100,100))
     preproc  = FacePreprocessor()
     extractor = LBPFeatureExtractor(grid_x=7, grid_y=7)
-    feature_db = build_feature_db(students, detector, preproc, extractor)
+    feature_db = build_feature_db(sequence, detector, preproc, extractor)
 
     gesture_sys = HandGestureRecognizer(max_hands=2)
     gesture_sys.add_gesture(OKSignGesture(threshold=23))
 
-    attempts = 0
-    matches = 0
-    distances = []
-    latencies = []
-
-    print("Ready for scanning. Press 'q' to quit.")
-    current = None
+    from collections import deque
+    queue = deque()
+    current_scan = None
     waiting_ok = False
     t0 = None
+    attempts = matches = 0
+    distances, latencies = [], []
+    alert = None
+    timeout_announced = False
 
+    # success banner
+    show_match_banner_until = 0.0
+    banner_text = ""
+
+    # --- Staff panel ---
+    panel = StaffPanelTk(title="Graduation Staff Panel")
+
+    def draw_instructions(frame, stage):
+        x0, y0 = 15, 15
+        if stage == "qr":
+            cv2.putText(frame, "1) Show QR Code", (x0, y0+30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200,255,200), 2)
+        elif stage == "ok":
+            cv2.putText(frame, "2) Show 'OK' sign when ready", (x0, y0+30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200,255,200), 2)
+
+    print("Ready. Press 'q' to quit.")
     while True:
         ok, frame = cap.read()
         if not ok:
             break
-
         H, W = frame.shape[:2]
 
-        # Step 1: Scan QR (lock to a student)
-        if current is None:
+        expected = sequence[idx] if idx < total_seq else None
+        next_hint = None
+        if idx+1 < total_seq:
+            n = sequence[idx+1]
+            next_hint = f"{n.get('seat_num','?')} | {n.get('name','?')}"
+
+        # --- Instructions ---
+        if current_scan is None:
+            draw_instructions(frame, "qr")
+        elif waiting_ok:
+            draw_instructions(frame, "ok")
+
+        # --- Step 1: QR ---
+        if current_scan is None:
             qr = try_decode_qr(frame)
             if qr and "student_id" in qr:
                 sid = qr["student_id"]
-                current = by_id.get(sid, qr)
-                waiting_ok = OK_REQUIRED
-                t0 = None
-        else:
-            cv2.putText(frame, f"Target: {current.get('name','?')} ({current.get('student_id','?')})",
-                        (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
 
-        # Step 2: Require OK gesture
-        if current is not None and waiting_ok:
+                if sid not in by_id:
+                    cv2.putText(frame, "Invalid QR code. Please try again.", (20, 80),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2)
+                else:
+                    scanned = by_id[sid]
+                    if expected:
+                        try:
+                            exp_seat = int(expected.get("seat_num", 0))
+                            got_seat = int(scanned.get("seat_num", 0))
+                        except:
+                            exp_seat = got_seat = -1
+                        if exp_seat != got_seat:
+                            alert = (f"Seat mismatch! Expected {exp_seat}, got {got_seat} "
+                                     f"({scanned.get('name','?')}). Press Force to accept anyway.")
+                            cv2.putText(frame, "Seat mismatch. Please wait for staff.", (20, 80),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2)
+                        else:
+                            current_scan = scanned
+                            waiting_ok = OK_REQUIRED
+                            t0 = None
+                            timeout_announced = False
+                    else:
+                        current_scan = scanned
+                        waiting_ok = OK_REQUIRED
+                        t0 = None
+                        timeout_announced = False
+
+        else:
+            cv2.putText(frame,
+                        f"Target: {current_scan.get('name','?')} ({current_scan.get('student_id','?')})",
+                        (20, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
+
+        # --- Step 2: OK gesture ---
+        if current_scan is not None and waiting_ok:
             if detect_ok_sign(gesture_sys, frame):
                 waiting_ok = False
                 t0 = time.monotonic()
-            else:
-                cv2.putText(frame, "Show OK Sign to continue…", (20, 80),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,255), 2)
+                timeout_announced = False
 
-        # Step 3: Timer + detect + compare with ONLY that student's feature
-        if current is not None and not waiting_ok:
+        # --- Step 3: Face compare ---
+        if current_scan is not None and not waiting_ok:
             if t0 is None:
                 t0 = time.monotonic()
             elapsed = time.monotonic() - t0
-            remaining = max(0.0, MATCH_TIMEOUT_SEC - elapsed)
-            cv2.putText(frame, f"Time left: {remaining:0.1f}s", (W-260, 240),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,0), 2)
+            sid = current_scan.get("student_id")
+            ref = feature_db.get(sid)
+            if ref is not None:
+                faces, _ = detector.detect_faces(frame)
+                empty = (faces is None or len(faces) == 0)
+                if not empty:
+                    x, y, w, h = max(faces, key=lambda b: b[2] * b[3])
+                    cv2.rectangle(frame, (x,y), (x+w, y+h), (0,255,0), 2)
 
-            sid = current.get("student_id")
-            target_feat = feature_db.get(sid)
+                    t_start = time.perf_counter()
+                    face_img = preproc.preprocess(frame, (x, y, w, h))
+                    feat = extractor.extract(face_img)
+                    dist = FaceRecognizer._chi2_distance(feat, ref)
+                    latency_ms = (time.perf_counter() - t_start) * 1000.0
 
-            if target_feat is None:
-                cv2.putText(frame, "No reference photo for this student.", (20, 120),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2)
-            else:
-                if elapsed <= MATCH_TIMEOUT_SEC:
-                    faces, _ = detector.detect_faces(frame)
-                    if not (faces is None or (hasattr(faces, "size") and faces.size == 0) or (hasattr(faces, "__len__") and len(faces) == 0)):
-                        boxes = faces.tolist() if hasattr(faces, "tolist") else list(faces)
-                        x, y, w, h = max(boxes, key=lambda b: b[2] * b[3])
-                        cv2.rectangle(frame, (x,y), (x+w, y+h), (0,255,0), 2)
+                    attempts += 1
+                    distances.append(dist)
+                    latencies.append(latency_ms)
 
-                        start = time.perf_counter()
-                        face_img = preproc.preprocess(frame, (x, y, w, h))
-                        feat = extractor.extract(face_img)
-                        dist = FaceRecognizer._chi2_distance(feat, target_feat) / 100
-                        latency_ms = (time.perf_counter() - start) * 1000.0
-
-                        attempts += 1
-                        distances.append(dist)
-                        latencies.append(latency_ms)
-
-                        cv2.putText(frame, f"Distance: {dist:.3f}", (20, 120),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.9,
-                                    (0,255,0) if dist < DISTANCE_THRESHOLD else (0,0,255), 2)
-
-                        if dist < DISTANCE_THRESHOLD:
-                            matches += 1
-                            cv2.putText(frame, "MATCH ✅", (20, 160),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,255,0), 3)
-                            current = None
-                            waiting_ok = False
-                            t0 = None
-                        else:
-                            cv2.putText(frame, "NOT MATCH", (20, 160),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,0,255), 3)
+                    if dist < DISTANCE_THRESHOLD:
+                        matches += 1
+                        queue.append(current_scan)
+                        show_match_banner_until = time.monotonic() + 2.5
+                        banner_text = "Face matched. Please proceed"
+                        current_scan = None
+                        waiting_ok = False
+                        t0 = None
+                        alert = None
+                        timeout_announced = False
                     else:
-                        cv2.putText(frame, "No face detected", (20, 120),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,0,255), 2)
-                else:
-                    cv2.putText(frame, "Matching timeout. Alert staff.", (20, 200),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,165,255), 2)
-                    current = None
-                    waiting_ok = False
-                    t0 = None
+                        if (elapsed > MATCH_TIMEOUT_SEC) and (not timeout_announced):
+                            alert = "Match timeout. Press Force to accept, or keep comparing."
+                            timeout_announced = True
 
-        # HUD metrics
+        # --- Staff Panel commands ---
+        cmd = panel.get_command_nowait()
+        if cmd == "quit":
+            break
+        elif cmd == "skip":
+            if expected:
+                idx = min(idx+1, total_seq)
+                alert = None
+                timeout_announced = False
+        elif cmd == "force":
+            target = current_scan if current_scan is not None else expected
+            if target is not None:
+                queue.append(target)
+                show_match_banner_until = time.monotonic() + 2.5
+                banner_text = "MATCH. Enqueued (Forced)"
+                if expected:
+                    idx = min(idx+1, total_seq)
+                current_scan = None
+                waiting_ok = False
+                t0 = None
+                alert = None
+                timeout_announced = False
+        elif cmd == "call":
+            if queue and not speaking_now.is_set():
+                called = queue[0]  # peek; don't pop yet
+                name  = called.get("name","(unknown)")
+                award = called.get("award","")
+
+                speaking_now.set()  # lock immediately so spam-clicks are ignored
+                print(f"[CALL] {name} — {award}")
+
+                def after_speak(success=True):
+                    try:
+                        # pop only if we actually spoke and the same student is still at front
+                        if success and queue and queue[0] is called:
+                            queue.popleft()
+                    finally:
+                        speaking_now.clear()
+
+                enqueue_tts(f"{name}. {award}.", after_speak)
+
+        # Keyboard fallback
+        key = cv2.waitKey(1) & 0xFF
+        if key in (ord('q'), 27):
+            break
+
+        # HUD
         rate = (matches / attempts) if attempts else 0.0
-        cv2.putText(frame, f"Attempts:{attempts} Matches:{matches} Rate:{rate:.2f}",
+        cv2.putText(frame, f"Attempts:{attempts}  Rate:{rate:.2f}",
                     (20, H-20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200,200,200), 2)
 
+        if time.monotonic() < show_match_banner_until:
+            overlay = frame.copy()
+            banner_h = 46
+            cv2.rectangle(overlay, (0, H - banner_h), (W, H), (0, 200, 0), -1)
+            cv2.addWeighted(overlay, 0.35, frame, 0.65, 0, frame)
+            cv2.putText(frame, banner_text, (18, H - 14),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
+
         cv2.imshow("Graduation Face Scanner", frame)
-        if cv2.waitKey(1) & 0xFF in (ord('q'), 27):
-            break
+        panel.update_status(expected, idx, total_seq, queue, alert, next_hint)
 
     cap.release()
     cv2.destroyAllWindows()
+    panel.shutdown()
 
-    # Final metrics
-    def p95(arr): 
+    # Stop TTS worker
+    speech_q.put(None)
+
+    def p95(arr):
         return float(np.percentile(arr, 95)) if arr else None
     print({
         "attempts": attempts,
-        "matches": matches,
-        "match_rate": rate,
         "avg_distance": float(np.mean(distances)) if distances else None,
         "p95_latency_ms": p95(latencies),
+        "queued_remaining": len(queue)
     })
 
 if __name__ == "__main__":
