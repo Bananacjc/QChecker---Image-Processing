@@ -959,9 +959,9 @@ CAM_INDEX = 0
 OK_REQUIRED = True
 MATCH_TIMEOUT_SEC = 10.0
 # --- Two-stage compare (LBP first, PCA fallback) ---
-LBP_DISTANCE_THRESHOLD = 10      # your current tuned value
-PCA_DISTANCE_THRESHOLD = 0.53      # start here; tune on your data
-PCA_COMPONENTS = 60                # 50–120 is usually fine
+LBP_DISTANCE_THRESHOLD = 20      # your current tuned value
+PCA_DISTANCE_THRESHOLD = 0.002    # better start for cosine on unit vectors
+PCA_COMPONENTS = 80              # 50–120 is usually fine
 
 
 # ---- helpers ----
@@ -1021,6 +1021,56 @@ def build_feature_db(students, detector, preproc, extractor):
 
     db = {sid: extractor.extract(face) for sid, face in per_face.items()}
     print(f"[train] Features ready for {ok_cnt} students; {miss_cnt} skipped.")
+    return db
+
+def build_feature_db_pca_centroid(students, detector, preproc, extractor, augmenter):
+    """
+    Build a PCA feature DB where each student vector is the centroid
+    of many augmented faces. Works only for PCA/LDA-style extractors.
+    """
+    per_sid_imgs = {}
+    ok_cnt = miss_cnt = 0
+
+    for s in students:
+        sid = s.get("student_id", "")
+        img_path = os.path.join("./known_faces", s.get("image_path", ""))
+        img = cv2.imread(img_path)
+        if img is None:
+            print(f"[train] Missing image: {img_path}")
+            miss_cnt += 1
+            continue
+
+        faces, _ = detector.detect_faces(img)
+        if faces is None or len(faces) == 0:
+            print(f"[train] No face detected: {img_path}")
+            miss_cnt += 1
+            continue
+
+        boxes = faces.tolist() if hasattr(faces, "tolist") else list(faces)
+        x, y, w, h = max(boxes, key=lambda b: b[2]*b[3])
+        face = preproc.preprocess(img, (x, y, w, h))
+
+        # use your existing augmenter to get multiple samples
+        per_sid_imgs.setdefault(sid, []).extend(augmenter.augment(face))
+        ok_cnt += 1
+
+    # Fit PCA on ALL augmented faces
+    all_faces = [f for lst in per_sid_imgs.values() for f in lst]
+    if hasattr(extractor, "fit") and all_faces:
+        extractor.fit(all_faces)
+
+    # Compute per-student centroid in feature space
+    db = {}
+    for sid, faces in per_sid_imgs.items():
+        feats = [extractor.extract(f) for f in faces]
+        center = np.mean(np.stack(feats, axis=0), axis=0)
+        # keep cosine sane: normalize centroid if extractor does L2
+        if getattr(extractor, "l2_normalize", False):
+            n = np.linalg.norm(center) + 1e-9
+            center = center / n
+        db[sid] = center.astype(np.float32)
+
+    print(f"[train] PCA-centroid features ready for {ok_cnt} students; {miss_cnt} skipped.")
     return db
 
 def detect_ok_sign(gesture_sys, frame_bgr):
@@ -1328,8 +1378,8 @@ def main():
     feature_db_lbp = build_feature_db(sequence, detector, preproc, extractor_lbp)
 
     # --- Stage 2: PCA (fallback; precompute so switching is instant) ---
-    extractor_pca = PCAFeatureExtractor(num_components=PCA_COMPONENTS)
-    feature_db_pca = build_feature_db(sequence, detector, preproc, extractor_pca)
+    extractor_pca = PCAFeatureExtractor(num_components=PCA_COMPONENTS, whiten=False, l2_normalize=True)
+    feature_db_pca = build_feature_db_pca_centroid(sequence, detector, preproc, extractor_pca, augmenter=ImageAugmenter())
 
     # --- Active extractor/DB (start with LBP) ---
     using_pca = False
