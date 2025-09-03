@@ -707,9 +707,7 @@ class LBPFeatureExtractor:
                 hist = hist.astype("float32") / (hist.sum() + 1e-6)
                 features.extend(hist)
         
-        features = np.array(features)
-        features /= np.linalg.norm(features) + 1e-6
-        return features
+        return np.array(features, dtype=np.float32)
 
 class FaceRecognizer:
     def __init__(self, extractor: 'FeatureExtractor' = None):
@@ -961,7 +959,7 @@ CAM_INDEX = 0
 OK_REQUIRED = True
 MATCH_TIMEOUT_SEC = 10.0
 # --- Two-stage compare (LBP first, PCA fallback) ---
-LBP_DISTANCE_THRESHOLD = 5      # your current tuned value
+LBP_DISTANCE_THRESHOLD = 10      # your current tuned value
 PCA_DISTANCE_THRESHOLD = 0.53      # start here; tune on your data
 PCA_COMPONENTS = 60                # 50–120 is usually fine
 
