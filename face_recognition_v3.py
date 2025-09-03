@@ -542,29 +542,34 @@ class FeatureExtractor(ABC):
         pass
 
 class PCAFeatureExtractor(FeatureExtractor):
-    '''
-    Eigenfaces, Simplest, Sensitive to lightning & backgrounf\n
-    For complex data, use num_components=80-150\n
-    '''
-    def __init__(self, num_components=50):
+    """
+    Eigenfaces with optional whitening and L2-normalized embeddings
+    → stable cosine distances in [0, 2].
+    """
+    def __init__(self, num_components=60, whiten=True, l2_normalize=True):
         self.num_components = num_components
+        self.whiten = whiten
+        self.l2_normalize = l2_normalize
         self.mean = None
-        self.components = None
-        
+        self.components = None   # [k, D]
+        self.singular = None     # [k]
+
     def fit(self, faces: list[np.ndarray]):
-        '''
-        faces: list of images
-        '''
-        X = np.array([f.flatten() for f in faces])
+        X = np.array([f.flatten().astype(np.float32) for f in faces])
         self.mean = np.mean(X, axis=0)
-        X_centered = X - self.mean
-        U, S, Vt = np.linalg.svd(X_centered, full_matrices=False)
-        self.components = Vt[:self.num_components]
-    
+        Xc = X - self.mean
+        U, S, Vt = np.linalg.svd(Xc, full_matrices=False)
+        self.components = Vt[:self.num_components].astype(np.float32)    # [k, D]
+        self.singular  = S[:self.num_components].astype(np.float32)      # [k]
+
     def extract(self, face_img: np.ndarray) -> np.ndarray:
-        x = face_img.flatten()
-        X_centered = x - self.mean
-        return np.dot(self.components, X_centered)
+        x = face_img.flatten().astype(np.float32)
+        z = self.components @ (x - self.mean)                            # [k]
+        if self.whiten:
+            z = z / (self.singular + 1e-6)
+        if self.l2_normalize:
+            z = z / (np.linalg.norm(z) + 1e-9)
+        return z.astype(np.float32)
 
 class LDAFeatureExtractor(FeatureExtractor):
     '''
@@ -715,18 +720,16 @@ class FaceRecognizer:
         self.distance_func = None
 
     def fit(self, faces, labels=None):
-        # Fit PCA or LDA depending on extractor type
         if isinstance(self.extractor, PCAFeatureExtractor):
             self.extractor.fit(faces)
-            self.distance_func = self._chi2_distance
-        elif isinstance(self.extractor, LDAFeatureExtractor) or isinstance(self.extractor, FastLDAFeatureExtractor):
+            self.distance_func = self._cosine_distance   # << PCA → cosine
+        elif isinstance(self.extractor, (LDAFeatureExtractor, FastLDAFeatureExtractor)):
             self.extractor.fit(faces, labels)
-            self.distance_func = self._chi2_distance
+            self.distance_func = self._cosine_distance   # << LDA → cosine
         elif isinstance(self.extractor, LBPFeatureExtractor):
-            self.distance_func = self._chi2_distance
+            self.distance_func = self._chi2_distance     # << LBP → χ²
         else:
             raise ValueError(f"Unknown extractor type: {type(self.extractor)}")
-
         self._trained = True
 
     def enroll(self, face_img, label):
@@ -816,6 +819,10 @@ class FaceRecognizer:
     @staticmethod
     def _chi2_distance(a, b, eps=1e-10):
         return 0.5 * np.sum(((a - b) ** 2) / (a + b + eps))
+    
+    @staticmethod
+    def _cosine_distance(a, b, eps=1e-9):
+        return 1.0 - float(np.dot(a, b) / ((np.linalg.norm(a) * np.linalg.norm(b)) + eps))    
     
 class FacePipeline:
     def __init__(self, students, debug=False, augmenter= None, detector=None, extractor=None):
@@ -954,8 +961,8 @@ CAM_INDEX = 0
 OK_REQUIRED = True
 MATCH_TIMEOUT_SEC = 10.0
 # --- Two-stage compare (LBP first, PCA fallback) ---
-LBP_DISTANCE_THRESHOLD = 0.10      # your current tuned value
-PCA_DISTANCE_THRESHOLD = 0.35      # start here; tune on your data
+LBP_DISTANCE_THRESHOLD = 5      # your current tuned value
+PCA_DISTANCE_THRESHOLD = 0.53      # start here; tune on your data
 PCA_COMPONENTS = 60                # 50–120 is usually fine
 
 
@@ -1353,6 +1360,7 @@ def main():
     # --- Staff panel ---
     panel = StaffPanelTk(title="Graduation Staff Panel")
 
+
     def draw_instructions(frame, stage):
         x0, y0 = 15, 15
         if stage == "qr":
@@ -1467,12 +1475,28 @@ def main():
                     t_start = time.perf_counter()
                     face_img = preproc.preprocess(frame, (x, y, w, h))
                     feat = extractor.extract(face_img)  # ACTIVE extractor
-                    dist = FaceRecognizer._chi2_distance(feat, ref)
+                    if using_pca:
+                        dist = FaceRecognizer._cosine_distance(feat, ref)
+                    else:
+                        dist = FaceRecognizer._chi2_distance(feat, ref)
                     latency_ms = (time.perf_counter() - t_start) * 1000.0
 
                     attempts += 1
                     distances.append(dist)
                     latencies.append(latency_ms)
+
+                    print(f"[DEBUG] sid={sid}, expected={expected.get('student_id')}, dist={dist:.4f}, thresh={dist_thresh}")
+
+                    if dist < dist_thresh:
+                        if sid == expected.get("student_id"):
+                            print("True Positive (correct match)")
+                        else:
+                            print("False Positive (wrong person accepted!)")
+                    else:
+                        if sid == expected.get("student_id"):
+                            print("False Negative (missed the correct person)")
+                        else:
+                            print("True Negative (correctly rejected)")
 
                     if dist < dist_thresh:
                         # --- success ---
