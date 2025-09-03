@@ -959,7 +959,7 @@ CAM_INDEX = 0
 OK_REQUIRED = True
 MATCH_TIMEOUT_SEC = 10.0
 # --- Two-stage compare (LBP first, PCA fallback) ---
-LBP_DISTANCE_THRESHOLD = 20      # your current tuned value
+LBP_DISTANCE_THRESHOLD = 13      # your current tuned value
 PCA_DISTANCE_THRESHOLD = 0.002    # better start for cosine on unit vectors
 PCA_COMPONENTS = 80              # 50–120 is usually fine
 
